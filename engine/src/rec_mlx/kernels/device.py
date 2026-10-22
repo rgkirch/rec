@@ -14,6 +14,7 @@ class DeviceProfile:
 
 def profile_for_device(info):
     chips = {
+        ("applegpu_g13s", "Apple M1 Max"): "M1 Max",
         ("applegpu_g16s", "Apple M4 Pro"): "M4 Pro",
         ("applegpu_g17s", "Apple M5 Pro"): "M5 Pro",
         ("applegpu_g17s", "Apple M5 Max"): "M5 Max",
