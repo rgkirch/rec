@@ -92,13 +92,13 @@ def transform(header, body, workers=40):
     sync = once(sync, f"uint goal=(phase+1u)*{workers};", f"uint goal=(phase+1u)*{groups};")
     sync = once(
         sync,
-        "atomic_fetch_add_explicit(control,",
-        "atomic_fetch_add_explicit(team_control,",
+        "atomic_fetch_add_explicit(control,1u,memory_order_relaxed)",
+        "atomic_fetch_add_explicit(team_control,1u,memory_order_relaxed)",
     )
     sync = once(
         sync,
-        "atomic_load_explicit(control,",
-        "atomic_load_explicit(team_control,",
+        "atomic_fetch_add_explicit(control,0u,memory_order_relaxed)",
+        "atomic_fetch_add_explicit(team_control,0u,memory_order_relaxed)",
         count=2,
     )
     header += "\n" + sync + "\n"
@@ -121,7 +121,7 @@ def transform(header, body, workers=40):
     header = replace_body(header, "attention_partial_path_w53", partial)
     header = replace_body(header, "attention_merge_vec4_w2", merge)
     body = once(body, "uint phase=0;", "uint phase=0;uint kv_phase=0;")
-    macro = "#define KV_TEAM_SYNC() if(!kv_team_sync(control,tid,kv_phase,ready,profile,group)){if(tid==0)diagnostic[group]=atomic_load_explicit(control+2,memory_order_relaxed);return;}"
+    macro = "#define KV_TEAM_SYNC() if(!kv_team_sync(control,tid,kv_phase,ready,profile,group)){if(tid==0)diagnostic[group]=atomic_fetch_add_explicit(control+2,0u,memory_order_relaxed);return;}"
     body = macro + "\n" + body
     if groups >= 10:
         body = once(

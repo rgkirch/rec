@@ -146,10 +146,10 @@ inline bool sync_all(device atomic_uint* control,uint tid,thread uint& phase,
             atomic_store_explicit(control+1,phase+1,memory_order_relaxed);
         }
         uint spins=0;
-        while(atomic_load_explicit(control+1,memory_order_relaxed)==phase &&
+        while(atomic_fetch_add_explicit(control+1,0u,memory_order_relaxed)==phase &&
               atomic_load_explicit(control+2,memory_order_relaxed)==0 && spins<10000000) ++spins;
         if(__PROFILE__) {uint at=(phase*__WORKERS__+group)*2;profile[at]=spins;profile[at+1]=arrived;}
-        ready[0]=uint(atomic_load_explicit(control+1,memory_order_relaxed)>phase);
+        ready[0]=uint(atomic_fetch_add_explicit(control+1,0u,memory_order_relaxed)>phase);
         if(!ready[0])atomic_store_explicit(control+2,phase+1,memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -807,11 +807,11 @@ inline bool expert_team_handoff(device uint* routing,device atomic_uint* control
         bool complete=true;
         for(uint peer=first;peer<first+count;++peer) {
             uint spins=0;
-            while(atomic_load_explicit((device atomic_uint*)(routing+peer*16+14),memory_order_relaxed)<layer+1 &&
+            while(atomic_fetch_add_explicit((device atomic_uint*)(routing+peer*16+14),0u,memory_order_relaxed)<layer+1 &&
                   atomic_load_explicit(control+2,memory_order_relaxed)==0 && spins<10000000) ++spins;
-            complete=complete && atomic_load_explicit((device atomic_uint*)(routing+peer*16+14),memory_order_relaxed)>=layer+1;
+            complete=complete && atomic_fetch_add_explicit((device atomic_uint*)(routing+peer*16+14),0u,memory_order_relaxed)>=layer+1;
         }
-        ready[0]=uint(complete && atomic_load_explicit(control+2,memory_order_relaxed)==0);
+        ready[0]=uint(complete && atomic_fetch_add_explicit(control+2,0u,memory_order_relaxed)==0);
         if(!ready[0])atomic_store_explicit(control+2,phase+1,memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -827,7 +827,7 @@ _BODY = r"""
     uint index=group*256+tid;
     device atomic_uint* control=(device atomic_uint*)private_control;
     threadgroup uint ready[1];uint phase=0;
-    #define SYNC() if(!sync_all(control,tid,phase,ready,profile,group)){if(tid==0)diagnostic[group]=atomic_load_explicit(control+2,memory_order_relaxed);return;}
+    #define SYNC() if(!sync_all(control,tid,phase,ready,profile,group)){if(tid==0)diagnostic[group]=atomic_fetch_add_explicit(control+2,0u,memory_order_relaxed);return;}
 
 
     threadgroup float reduction[33];
@@ -917,7 +917,7 @@ _BODY = r"""
                 if(group<__TEAM_MLP_WORKERS__) {
                     expert_team_gateup(bank,d,n,ids,silu_table,act,lane,simdgroup_index_in_threadgroup,group);
                     if(!expert_team_handoff(routing,control,tid,group,layer,phase,ready)) {
-                        if(tid==0)diagnostic[group]=atomic_load_explicit(control+2,memory_order_relaxed);
+                        if(tid==0)diagnostic[group]=atomic_fetch_add_explicit(control+2,0u,memory_order_relaxed);
                         return;
                     }
                     expert_team_down(bank,d,act,ids,down,lane,simdgroup_index_in_threadgroup,group);

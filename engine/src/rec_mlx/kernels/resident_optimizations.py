@@ -39,10 +39,10 @@ def transform(header, *, rms=True, monotonic=True):
         uint goal=(phase+1u)*__WORKERS__;
         uint arrived=atomic_fetch_add_explicit(control,1u,memory_order_relaxed);
         uint spins=0;
-        while(atomic_load_explicit(control,memory_order_relaxed)<goal &&
+        while(atomic_fetch_add_explicit(control,0u,memory_order_relaxed)<goal &&
               atomic_load_explicit(control+2,memory_order_relaxed)==0 && spins<10000000) ++spins;
         if(__PROFILE__) {uint at=(phase*__WORKERS__+group)*2;profile[at]=spins;profile[at+1]=arrived-phase*__WORKERS__;}
-        ready[0]=uint(atomic_load_explicit(control,memory_order_relaxed)>=goal);
+        ready[0]=uint(atomic_fetch_add_explicit(control,0u,memory_order_relaxed)>=goal);
         if(!ready[0])atomic_store_explicit(control+2,phase+1,memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

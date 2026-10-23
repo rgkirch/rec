@@ -5,7 +5,8 @@ import mlx.core as mx
 
 from rec_mlx.kernels import expert_teams, megakernel, mixed_bits, rank_routing
 from rec_mlx.kernels.device import profile_for_device
-from rec_mlx.kernels.kv_teams import function
+from rec_mlx.kernels.kv_teams import function, transform as kv_teams_transform
+from rec_mlx.kernels.resident_optimizations import transform as resident_transform
 
 
 def resident_device():
@@ -120,6 +121,41 @@ class RoutingTests(unittest.TestCase):
         self.assertIn("uint teams=shared?2:1", gateup)
         self.assertIn("uint first=group>=6?6", handoff)
         self.assertIn("count=group>=6?2:1", handoff)
+        legacy_sync = function(megakernel._HEADER, "sync_all")
+        self.assertIn(
+            "atomic_fetch_add_explicit(control+1,0u,memory_order_relaxed)==phase",
+            legacy_sync,
+        )
+        self.assertIn(
+            "atomic_fetch_add_explicit((device atomic_uint*)(routing+peer*16+14),0u,memory_order_relaxed)<layer+1",
+            handoff,
+        )
+
+        optimized_header = resident_transform(header)
+        optimized_header = optimized_header.replace("__WORKERS__", str(profile.workers))
+        optimized_header = optimized_header.replace("__PROFILE__", "0")
+        optimized_header = optimized_header.replace(
+            "__ATTENTION_GROUPS__", str(profile.workers * 8)
+        )
+        optimized_header = optimized_header.replace(
+            "__MERGE_GROUPS__", str(profile.workers * 8)
+        )
+        sync = function(optimized_header, "sync_all")
+        self.assertEqual(
+            sync.count("atomic_fetch_add_explicit(control,0u,memory_order_relaxed)"), 2
+        )
+        rendered_body = megakernel._BODY.replace("__WORKERS__", str(profile.workers))
+        rendered_body = rendered_body.replace("__MERGE_WORKERS__", str(profile.workers))
+        team_header, _ = kv_teams_transform(
+            optimized_header,
+            rendered_body,
+            profile.workers,
+        )
+        team_sync = function(team_header, "kv_team_sync")
+        self.assertEqual(
+            team_sync.count("atomic_fetch_add_explicit(team_control,0u,memory_order_relaxed)"),
+            2,
+        )
 
     def test_native_bf16_expert_reduction(self):
         for workers in (32, 64):
