@@ -106,6 +106,21 @@ class RoutingTests(unittest.TestCase):
                     self.assertEqual(routing[:, 14].tolist(), [123] * workers)
                     self.assertEqual(routing[:, 15].tolist(), [0xFFFFFFFF] * workers)
 
+    def test_m1_profile_uses_supported_eight_group_expert_teams(self):
+        profile = profile_for_device(
+            {"architecture": "applegpu_g13s", "device_name": "Apple M1 Max"}
+        )
+        self.assertEqual(
+            (profile.workers, profile.mlp_workers, profile.head_workers), (8, 8, 8)
+        )
+        header = expert_teams.transform(megakernel._HEADER, profile.mlp_workers)
+        gateup = function(header, "expert_team_gateup")
+        handoff = function(header, "expert_team_handoff")
+        self.assertIn("bool shared=group>=6;", gateup)
+        self.assertIn("uint teams=shared?2:1", gateup)
+        self.assertIn("uint first=group>=6?6", handoff)
+        self.assertIn("count=group>=6?2:1", handoff)
+
     def test_native_bf16_expert_reduction(self):
         for workers in (32, 64):
             for bits, specialized in ((4, False), (3, False), (3, True)):

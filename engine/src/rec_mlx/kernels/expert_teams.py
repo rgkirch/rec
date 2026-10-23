@@ -2,7 +2,7 @@ from .kv_teams import function
 
 
 def transform(header, mlp_workers):
-    assert mlp_workers in (32, 64)
+    assert mlp_workers in (8, 32, 64)
     team = mlp_workers // 8
     for name in ("expert_team_gateup", "expert_team_down", "expert_team_handoff"):
         old = function(header, name)
