@@ -352,6 +352,9 @@ def validate_layer0_stages(engine, model, captured_stages):
             mx.max(mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))).item()
         )
         row = dict(stage=name, exact=unequal == 0, unequal=unequal, max_abs=max_abs)
+        if name in ("query", "key", "value"):
+            by_head = mx.sum((actual != expected).reshape(-1, 128), axis=1).tolist()
+            row["unequal_by_head"] = by_head
         results.append(row)
         print(json.dumps(row), flush=True)
     first = next((row["stage"] for row in results if not row["exact"]), None)
