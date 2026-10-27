@@ -207,6 +207,16 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Implementation:** Added `--qkv-single-owner` to the stage diagnostic. It replaces only the test kernel's shared QKV queue with per-group full-head work and a global barrier; the checked-in runtime source/profile remain unchanged. Static Python compilation and CLI checks pass; Metal validation is pending.
 
+### 2026-10-27 — Single-owner QKV diagnostic result
+
+**Procedure:** Ran the test-only single-owner QKV schedule at 12/8/8, then at 8/8/8 as a control. The independent one-threadgroup-per-head check ran alongside both.
+
+**Results:** The independent projection check matched all 40 Q/K/V heads exactly in both runs. The single-owner full path matched all stages at 8/8/8. At 12/8/8, Q and V matched exactly, but K had 192/512 unequal values (heads 0:32, 1:0, 2:64, 3:96); attention and later stages diverged.
+
+**Interpretation:** Assigning whole heads to resident groups restores Q and V in this diagnostic but does not validate the 12-worker schedule; the K path remains incorrect. This variant adds a global QKV barrier and is test-only. No runtime schedule or default profile has changed.
+
+**Instrumentation cleanup:** The raw pre-normalization capture is known to be inconsistent at 12 workers and adds global barriers to the standard diagnostic. Remove that capture and those extra barriers; retain only the post-QKV stage captures and independent per-head check. Then rerun the standard 12-worker stage diagnostic against the unmodified shared-QKV schedule.
+
 ### 2026-10-27 — Single-owner probe source-rendering correction
 
 **Observation:** The first `--qkv-single-owner` run failed Metal compilation before inference. The test replacement inserted `__LOGBASE__` and `__EPS__` after the normal source-rendering pass, leaving those placeholders undeclared.
