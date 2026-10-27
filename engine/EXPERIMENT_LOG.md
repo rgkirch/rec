@@ -291,4 +291,12 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Next probe:** Assign exactly one head to each group per round, with a global barrier between rounds, and compare raw and normalized Q/K/V. This tests whether reusing a threadgroup across multiple head iterations causes the mismatch.
 
-**Implementation:** Added the test-only `--qkv-rounds` mode. It uses the independent `q4_local_block` work for one head per group, globally synchronizes each round, then snapshots raw Q/K/V and normalizes/publishes them. No runtime source changed. Python/static checks are pending before the next M1 run.
+**Implementation:** Added the test-only `--qkv-rounds` mode. It uses the independent `q4_local_block` work for one head per group, globally synchronizes each round, then snapshots raw Q/K/V and normalizes/publishes them. No runtime source changed.
+
+### 2026-10-27 — Synchronized-round QKV result
+
+**Procedure:** Ran `--qkv-rounds` at 8/8/8 and 12/8/8. The 8-worker control passed all raw, normalized, per-worker input, and downstream comparisons. At 12, all per-group inputs still matched, but the raw discrepancies remained on Q heads 22/23 and all K heads; V remained exact. Normalized Q/K and downstream stages failed parity.
+
+**Interpretation:** The mismatch is not caused merely by looping over multiple heads in one threadgroup: one head per group per globally synchronized round still fails. The independent per-head kernel remains exact. Need directly verify payload publication in the 12-group global and three-group KV barriers before narrowing the arithmetic schedule further.
+
+**Next probe:** Add a small deterministic barrier stress test for `sync_all` at 12 groups and `kv_team_sync` with four teams of three groups; each group will publish a phase-tagged payload, synchronize, verify peer payloads, and repeat.
