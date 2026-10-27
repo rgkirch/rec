@@ -74,3 +74,11 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Results:** At step 1, the embedding trace row matched exactly. The first divergent row was row 1 (layer 0): 2,044 of 2,048 values differed, with maximum absolute difference 0.18579. The remaining layer rows also differed; final logits differed in 148,942 values, maximum absolute difference 19.8828. The run stopped at step 1, so no sustained-decode result exists.
 
 **Interpretation:** The error begins within the first model layer, not in token embedding or sampling. The probe does not identify which layer-0 operation is responsible. Before attributing this solely to the 12-worker kernel, run the same harness at the validated 8/8/8 profile as a control.
+
+### 2026-10-27 — 8/8/8 harness control
+
+**Steps:** Ran the same two-step focused validator with `--workers 8 --sustained-steps 2 --repeats 1`.
+
+**Results:** Both decode steps passed exact native parity for all layer traces and logits. The output reported two native layer checks and no diagnostics.
+
+**Interpretation:** The focused harness and fixed-token/native-cache comparison pass at the known-good 8/8/8 profile. The 12/8/8 failure is therefore specific to the changed resident-worker configuration under this test; its first divergent kernel stage remains unknown.
