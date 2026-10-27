@@ -113,11 +113,75 @@ def same_kv(a, b):
     return all(mx.array_equal(x, y).item() for x, y in zip(a.banks, b.banks, strict=True))
 
 
+def validate_sustained_native(engine, model, steps, repeats):
+    mx.eval(model.native.parameters())
+    results = []
+    token = 150006
+    prompt = [1]
+    for repeat in range(repeats):
+        session = engine.make_session(max_new_tokens=steps + 1)
+        native_session = engine.make_session(max_new_tokens=steps + 1)
+        logits = session.prefill(prompt)
+        native_prefill_logits = native_session.prefill(prompt)
+        assert mx.array_equal(logits, native_prefill_logits).item(), "Prefill logits differ"
+        assert same_kv(session._state["kv"], native_session._state["kv"]), "Prefill KV differs"
+        native_cache = native_session.prompt_cache.layers
+        for row, cache in zip(engine.metadata[:49], native_cache, strict=True):
+            if not row[1]:
+                cache.grow(len(prompt) + steps + 1)
+
+        for step in range(steps):
+            logits, trace = engine.forward(session._state, token)
+            h = model.native.model.embed_tokens(mx.array([[token]], mx.int32))
+            native_trace = [h.reshape(-1)]
+            for layer, cache in zip(model.native.layers, native_cache, strict=True):
+                h = layer(h, None, cache)
+                native_trace.append(h.reshape(-1))
+            native_logits = model.native.lm_head(model.native.model.norm(h))
+            assert mx.array_equal(mx.stack(native_trace), trace).item(), (
+                f"Native layer mismatch at repeat {repeat + 1}, step {step + 1}"
+            )
+            assert mx.array_equal(native_logits.reshape(-1), logits).item(), (
+                f"Native logits mismatch at repeat {repeat + 1}, step {step + 1}"
+            )
+
+        row = dict(repeat=repeat + 1, steps=steps, native_layer_checks=steps)
+        results.append(row)
+        print(json.dumps(row), flush=True)
+        del session, native_session, native_cache
+        mx.clear_cache()
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True, help="Flint checkpoint directory")
-    parser.add_argument("--output", type=Path, required=True, help="JSON file for the results")
+    parser.add_argument("--output", type=Path, help="Optional JSON file for the results")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="Experimental resident-worker override; leaves MLP/head workers unchanged",
+    )
+    parser.add_argument(
+        "--sustained-steps",
+        type=int,
+        default=0,
+        help="Run only repeated-token native parity for this many decode steps",
+    )
+    parser.add_argument("--repeats", type=int, default=1)
     args = parser.parse_args()
+    if args.sustained_steps < 0 or args.repeats < 1:
+        parser.error("--sustained-steps must be nonnegative and --repeats must be positive")
+    if args.workers is not None:
+        from dataclasses import replace
+
+        from rec_mlx.kernels import device
+
+        base_profile = device.profile_for_device(mx.device_info())
+        if base_profile.chip != "M1 Max":
+            parser.error("--workers override is reserved for the M1 Max experiment")
+        experimental_profile = replace(base_profile, workers=args.workers)
+        device.profile_for_device = lambda _info: experimental_profile
     mx.set_cache_limit(256 * 1024**2)
     model = QATModel(args.model)
     specification = {}
@@ -130,6 +194,12 @@ def main():
 
     megakernel._metal = capture_specification
     engine, resident = build_decoder(model, optimized=True)
+    print("profile:", engine.device_profile, flush=True)
+    if args.sustained_steps:
+        validate_sustained_native(
+            engine, model, args.sustained_steps, args.repeats
+        )
+        return
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, local_files_only=True, fix_mistral_regex=False
     )
@@ -391,8 +461,9 @@ def main():
         stopping=stopping,
         performance=performance,
     )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2) + "\n")
 
 
 if __name__ == "__main__":

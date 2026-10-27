@@ -48,3 +48,11 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Results:** The five safetensors shards and tokenizer were materialized in `/Users/me/mirror/huggingface.co/RecursiveSI/flint-int4`; the model directory is about 22 GB and the model repository worktree remains clean. No checkpoint was copied to or read from `/tmp`, and nothing was pushed.
 
 **Interpretation:** The persistent checkpoint prerequisite is resolved. The project’s `engine/.gitignore` already ignores `engine/.venv/`, so a project-local Python environment can be used without adding environment files to Git. Environment setup and 12-worker validation remain to be done.
+
+### 2026-10-27 — Focused worker-parity harness
+
+**Question:** Can a worker-count trial check native parity over sustained decode without changing the default M1 profile or leaving loose run files?
+
+**Steps:** Extended the existing `engine/tests/validate_resident.py` harness with a test-only `--workers` override, `--sustained-steps`, and `--repeats`. The override changes only the resident `workers` field; MLP/head widths remain at the device profile values. The focused mode uses a one-token prompt and a fixed non-EOS token, comparing every Rec decode step’s full layer trace and logits with native MLX. The full validator remains the default mode, and result-file output is optional.
+
+**Checks:** Python compilation, CLI help, the existing M1 profile routing test, the BF16 expert-reduction test, and `git diff --check` passed. The 12-worker mode has not yet been run.
