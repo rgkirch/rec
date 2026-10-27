@@ -460,7 +460,7 @@ def validate_layer0_stages(
     activation = nn.silu(gate) * up
     down = layer.mlp.down_proj(activation)
     output = attention_residual + down
-    independent, independent_raw = projection_kernel(
+    independent_raw, independent = projection_kernel(
         inputs=[engine.banks[0], native_session._state["metadata"], input_norm.reshape(-1)],
         grid=(40 * 256, 1, 1),
         threadgroup=(256, 1, 1),
