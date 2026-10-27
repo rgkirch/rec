@@ -277,4 +277,6 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Next probe:** Capture the pre-normalized hidden input and normalized `n` tensor separately for each of the 12 threadgroups at layer 0. Compare every group against native to see whether groups that own the divergent heads already have different inputs.
 
-**Implementation:** Added a test-only `worker_trace` output recording layer-0 hidden input and normalized `n` for each resident group. It is independent of the QKV schedule variant and leaves runtime code unchanged. Python/static checks pass; run the 8-worker control before interpreting 12-worker values.
+**Implementation:** Added a test-only capture of layer-0 hidden input and normalized `n` for each resident group. It is independent of the QKV schedule variant and leaves runtime code unchanged.
+
+**Tooling failure:** The first M1 run failed Metal compilation: adding a second kernel output exceeded MLX's Metal buffer binding limit (`buffer(31)`, valid range ends at 30). No inference result was produced. Pack the per-worker slices into the existing stage-trace output instead, preserving a single added binding, then rerun the 8-worker control.

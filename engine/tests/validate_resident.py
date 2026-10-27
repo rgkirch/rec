@@ -290,14 +290,15 @@ def instrument_stage_kernel(
             f"stage_trace[{slot}u*{width}u+capture_i]=h[capture_j];}}}}"
         )
 
+    worker_trace_base = 16 * width
     worker_input_capture = (
-        "if(layer==0){for(uint capture_j=0;capture_j<8;++capture_j){"
+        f"if(layer==0){{for(uint capture_j=0;capture_j<8;++capture_j){{"
         "uint capture_i=(tid+(capture_j/4)*256)*4+capture_j%4;"
-        "worker_trace[group*4096u+capture_i]=h[capture_j];}}"
+        f"stage_trace[{worker_trace_base}u+group*4096u+capture_i]=h[capture_j];}}}}"
     )
     worker_norm_capture = (
         "if(layer==0)for(uint capture_i=tid;capture_i<2048;capture_i+=256)"
-        "worker_trace[group*4096u+2048u+capture_i]=n[capture_i];"
+        f"stage_trace[{worker_trace_base}u+group*4096u+2048u+capture_i]=n[capture_i];"
     )
     rms_anchor = "        {rms_256_w4(h,(const device bfloat16_t*)(bank+d[3]),n,"
     if source.count(rms_anchor) != 1:
@@ -384,7 +385,7 @@ def instrument_stage_kernel(
     )
 
     options["source"] = source
-    options["output_names"] = [*options["output_names"], "stage_trace", "worker_trace"]
+    options["output_names"] = [*options["output_names"], "stage_trace"]
     return metal(name="flint_decode_stage_probe", **options)
 
 
@@ -718,19 +719,17 @@ def main():
         def capture_stages(*call_args, **call_kwargs):
             call_kwargs = dict(call_kwargs)
             call_kwargs["output_shapes"] = [
-                *call_kwargs["output_shapes"],
-                (16, 6144),
-                (args.workers, 4096),
+                *call_kwargs["output_shapes"], (16 * 6144 + args.workers * 4096,)
             ]
             call_kwargs["output_dtypes"] = [
-                *call_kwargs["output_dtypes"],
-                mx.bfloat16,
-                mx.bfloat16,
+                *call_kwargs["output_dtypes"], mx.bfloat16
             ]
             outputs = stage_kernel(*call_args, **call_kwargs)
-            captured_stages["values"] = outputs[-2]
-            captured_stages["workers"] = outputs[-1]
-            return outputs[:-2]
+            captured_stages["values"] = outputs[-1][: 16 * 6144].reshape(16, 6144)
+            captured_stages["workers"] = outputs[-1][
+                16 * 6144 :
+            ].reshape(args.workers, 4096)
+            return outputs[:-1]
 
         engine.kernel = capture_stages
         validate_layer0_stages(
