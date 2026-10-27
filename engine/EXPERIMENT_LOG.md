@@ -55,4 +55,14 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Steps:** Extended the existing `engine/tests/validate_resident.py` harness with a test-only `--workers` override, `--sustained-steps`, and `--repeats`. The override changes only the resident `workers` field; MLP/head widths remain at the device profile values. The focused mode uses a one-token prompt and a fixed non-EOS token, comparing every Rec decode step’s full layer trace and logits with native MLX. The full validator remains the default mode, and result-file output is optional.
 
-**Checks:** Python compilation, CLI help, the existing M1 profile routing test, the BF16 expert-reduction test, and `git diff --check` passed. The 12-worker mode has not yet been run.
+**Checks:** Python compilation, CLI help, the existing M1 profile routing test, the BF16 expert-reduction test, and `git diff --check` passed.
+
+### 2026-10-27 — 12/8/8 two-step smoke test
+
+**Question:** Does the 12-resident-worker, 8-MLP-worker, 8-head-worker profile pass even a short native parity check after the RMW barrier change?
+
+**Steps:** Ran `engine/tests/validate_resident.py` against the persistent mirrored Flint INT4 checkpoint with `--workers 12 --sustained-steps 2 --repeats 1`. The prompt was `[1]`; the decode input was fixed token `150006`. The runtime printed the intended `12/8/8` profile and compiled/launched the kernel.
+
+**Result:** Exact native layer-trace parity failed at repeat 1, step 1. The initial harness stopped at that assertion before checking logits and did not print per-layer differences. No sustained result or throughput measurement was obtained.
+
+**Interpretation:** This is a real post-RMW correctness failure for the tested 12/8/8 path, not evidence that every 12-worker schedule fails. The mismatching trace row and stage are not yet known. The next harness revision will report per-row differences and logits before stopping.

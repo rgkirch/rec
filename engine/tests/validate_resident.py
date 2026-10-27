@@ -137,13 +137,46 @@ def validate_sustained_native(engine, model, steps, repeats):
             for layer, cache in zip(model.native.layers, native_cache, strict=True):
                 h = layer(h, None, cache)
                 native_trace.append(h.reshape(-1))
-            native_logits = model.native.lm_head(model.native.model.norm(h))
-            assert mx.array_equal(mx.stack(native_trace), trace).item(), (
-                f"Native layer mismatch at repeat {repeat + 1}, step {step + 1}"
-            )
-            assert mx.array_equal(native_logits.reshape(-1), logits).item(), (
-                f"Native logits mismatch at repeat {repeat + 1}, step {step + 1}"
-            )
+            native_logits = model.native.lm_head(model.native.model.norm(h)).reshape(-1)
+            native_trace = mx.stack(native_trace)
+            trace_equal = mx.array_equal(native_trace, trace).item()
+            logits_equal = mx.array_equal(native_logits, logits.reshape(-1)).item()
+            if not trace_equal or not logits_equal:
+                detail = dict(
+                    repeat=repeat + 1,
+                    step=step + 1,
+                    trace_equal=trace_equal,
+                    logits_equal=logits_equal,
+                    native_trace_shape=list(native_trace.shape),
+                    rec_trace_shape=list(trace.shape),
+                )
+                if native_trace.shape == trace.shape and native_trace.ndim == 2:
+                    difference = mx.abs(
+                        native_trace.astype(mx.float32) - trace.astype(mx.float32)
+                    )
+                    unequal = mx.sum(native_trace != trace, axis=1).tolist()
+                    maximum = mx.max(difference, axis=1).tolist()
+                    first = next((index for index, count in enumerate(unequal) if count), None)
+                    detail.update(
+                        unequal_per_trace_row=unequal,
+                        max_abs_per_trace_row=maximum,
+                        first_divergent_trace_row=first,
+                        first_divergent_model_layer=None if first is None else first - 1,
+                    )
+                if not logits_equal:
+                    detail["logits_unequal"] = int(
+                        mx.sum(native_logits != logits.reshape(-1)).item()
+                    )
+                    detail["logits_max_abs"] = float(
+                        mx.max(
+                            mx.abs(
+                                native_logits.astype(mx.float32)
+                                - logits.reshape(-1).astype(mx.float32)
+                            )
+                        ).item()
+                    )
+                print(json.dumps(detail), flush=True)
+                raise AssertionError("Native parity mismatch")
 
         row = dict(repeat=repeat + 1, steps=steps, native_layer_checks=steps)
         results.append(row)
