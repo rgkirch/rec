@@ -136,3 +136,11 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** Q/K/V corruption is run-variable, and this sample's errors cluster in later head indices. That pattern is not stable enough to identify a single KV team as the cause. The changing totals are consistent with a race or incomplete work distribution, but do not prove which mechanism.
 
 **Next probe:** Repeat 12/8/8 again with the same instrumented shader and compare per-head patterns before changing the shared projection implementation.
+
+### 2026-10-27 — Second 12-worker Q/K/V repeat
+
+**Results:** A further 12/8/8 run again produced Q=1,344, K=160, and V=44 unequal values. Q heads 0–17 matched; head 18 and heads 21, 23–31 differed, with head 26 partially different. K heads 0–1 matched, head 2 differed completely, and head 3 partially; V heads 0–1 matched, with partial mismatches in head 2 and head 3. Attention core remained incorrect (2,046/4,096 values).
+
+**Interpretation:** Across the two per-head runs, corruption remains concentrated in later Q/K/V heads but individual values/head counts vary. This is evidence of nondeterministic corruption in the shared projection path, not a stable head-index mapping error. It still does not distinguish raw matrix projection from Q/K normalization or KV publication.
+
+**Next probe:** Capture the Q/K/V projection outputs before head normalization, then compare raw and normalized values separately.
