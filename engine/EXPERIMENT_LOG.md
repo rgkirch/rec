@@ -263,4 +263,4 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Next probe:** After the projection global barrier, snapshot raw Q/K/V from group 0, synchronize again, then proceed with normalization. Compare those raw vectors directly to native projections; this separates projection work from head normalization/publication.
 
-**Implementation:** Extended only the `--qkv-two-phase` test shader with a group-0 raw Q/K/V snapshot between global barriers and raw-stage comparisons against native projections. The buffer now allocates slots 13–15 for those raw vectors. Static checks and 8-worker capture control are pending.
+**Implementation:** Extended only the `--qkv-two-phase` test shader with a group-0 raw Q/K/V snapshot between global barriers and raw-stage comparisons against native projections. The buffer now allocates slots 13–15 for those raw vectors. Also extended the independent one-head kernel to return its pre-normalization projections, so the fused schedule can be compared directly against the same Q4 computation rather than only native outputs. Static checks and the raw-capture controls are pending.

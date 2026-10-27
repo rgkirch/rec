@@ -390,9 +390,11 @@ def make_single_head_projection_kernel(specification, metal):
     m.s+=local*128*32;
     m.b+=local*128*32;
     m.n=128;
-    device bfloat16_t* out=projection+head*128;
+    device bfloat16_t* out=raw_projection+head*128;
     for(uint block=simd;block<32;block+=8)
         q4_local_block<2048>(m,n,out,lane,block*4);
+    threadgroup_barrier(mem_flags::mem_device);
+    for(uint dim=tid;dim<128;dim+=256)projection[head*128+dim]=out[dim];
     threadgroup_barrier(mem_flags::mem_device);
     if(simd==0&&head<36)
         head_norm(out,(const device bfloat16_t*)(bank0+d[head<32?5:6]),1,false,0u,0.0f,1e-6f,lane,0);
@@ -401,7 +403,7 @@ def make_single_head_projection_kernel(specification, metal):
     options = dict(specification)
     options.update(
         input_names=["bank0", "metadata", "normalized"],
-        output_names=["projection"],
+        output_names=["projection", "raw_projection"],
         source=source,
     )
     return metal(name="flint_independent_head_projection", **options)
@@ -458,13 +460,13 @@ def validate_layer0_stages(
     activation = nn.silu(gate) * up
     down = layer.mlp.down_proj(activation)
     output = attention_residual + down
-    independent = projection_kernel(
+    independent, independent_raw = projection_kernel(
         inputs=[engine.banks[0], native_session._state["metadata"], input_norm.reshape(-1)],
         grid=(40 * 256, 1, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[(40, 128)],
-        output_dtypes=[mx.bfloat16],
-    )[0]
+        output_shapes=[(40, 128), (40, 128)],
+        output_dtypes=[mx.bfloat16, mx.bfloat16],
+    )
     native_qkv = mx.concatenate(
         (
             query.reshape(32, 128),
@@ -473,7 +475,15 @@ def validate_layer0_stages(
         ),
         axis=0,
     )
-    mx.eval(independent, native_qkv)
+    native_raw_qkv = mx.concatenate(
+        (
+            raw_query.reshape(32, 128),
+            raw_keys.reshape(4, 128),
+            raw_values.reshape(4, 128),
+        ),
+        axis=0,
+    )
+    mx.eval(independent, independent_raw, native_qkv, native_raw_qkv)
     independent_unequal = mx.sum(independent != native_qkv, axis=1).tolist()
     print(
         json.dumps(
@@ -485,7 +495,50 @@ def validate_layer0_stages(
         ),
         flush=True,
     )
+    independent_raw_unequal = mx.sum(independent_raw != native_raw_qkv, axis=1).tolist()
+    independent_raw_max_abs = float(
+        mx.max(mx.abs(independent_raw.astype(mx.float32) - native_raw_qkv.astype(mx.float32))).item()
+    )
+    print(
+        json.dumps(
+            dict(
+                stage="independent_raw_qkv",
+                exact=not any(independent_raw_unequal),
+                max_abs=independent_raw_max_abs,
+                unequal_by_head=independent_raw_unequal,
+            )
+        ),
+        flush=True,
+    )
     if capture_raw_qkv:
+        captured_raw_qkv = mx.concatenate(
+            (
+                stages[13, :4096].reshape(32, 128),
+                stages[14, :512].reshape(4, 128),
+                stages[15, :512].reshape(4, 128),
+            ),
+            axis=0,
+        )
+        captured_raw_unequal = mx.sum(captured_raw_qkv != independent_raw, axis=1).tolist()
+        captured_raw_max_abs = float(
+            mx.max(
+                mx.abs(
+                    captured_raw_qkv.astype(mx.float32)
+                    - independent_raw.astype(mx.float32)
+                )
+            ).item()
+        )
+        print(
+            json.dumps(
+                dict(
+                    stage="captured_raw_vs_independent",
+                    exact=not any(captured_raw_unequal),
+                    max_abs=captured_raw_max_abs,
+                    unequal_by_head=captured_raw_unequal,
+                )
+            ),
+            flush=True,
+        )
         raw_references = (
             ("raw_query", 13, raw_query),
             ("raw_key", 14, raw_keys),
@@ -498,9 +551,16 @@ def validate_layer0_stages(
             max_abs = float(
                 mx.max(mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))).item()
             )
+            by_head = mx.sum((actual != expected).reshape(-1, 128), axis=1).tolist()
             print(
                 json.dumps(
-                    dict(stage=name, exact=unequal == 0, unequal=unequal, max_abs=max_abs)
+                    dict(
+                        stage=name,
+                        exact=unequal == 0,
+                        unequal=unequal,
+                        max_abs=max_abs,
+                        unequal_by_head=by_head,
+                    )
                 ),
                 flush=True,
             )
