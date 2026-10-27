@@ -215,7 +215,7 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Interpretation:** Assigning whole heads to resident groups restores Q and V in this diagnostic but does not validate the 12-worker schedule; the K path remains incorrect. This variant adds a global QKV barrier and is test-only. No runtime schedule or default profile has changed.
 
-**Instrumentation cleanup:** The raw pre-normalization capture is known to be inconsistent at 12 workers and adds global barriers to the standard diagnostic. Remove that capture and those extra barriers; retain only the post-QKV stage captures and independent per-head check. Then rerun the standard 12-worker stage diagnostic against the unmodified shared-QKV schedule.
+**Instrumentation cleanup:** Removed the inconsistent raw pre-normalization capture and its extra global barriers from the standard diagnostic. The stage buffer now retains only post-QKV captures and the independent per-head check. Python compilation, CLI help, and `git diff --check` pass. Rerun the standard 12-worker stage diagnostic against the unmodified shared-QKV schedule.
 
 ### 2026-10-27 — Single-owner probe source-rendering correction
 

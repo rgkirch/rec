@@ -298,26 +298,6 @@ def instrument_stage_kernel(
     down_sync = source.index("SYNC();", down_start) + len("SYNC();")
     source = source[:down_sync] + store_vector(7, "down", 2048) + source[down_sync:]
 
-    if not single_owner_qkv:
-        projection_anchor = "KV_TEAM_SYNC();\n        for(uint member=kv_member;member<10;member+="
-        if source.count(projection_anchor) != 1:
-            raise ValueError(
-                f"Expected one shared-projection snapshot anchor, found {source.count(projection_anchor)}"
-            )
-        raw_projection_capture = (
-            "KV_TEAM_SYNC();\n        SYNC();\n"
-            "        if(group==0&&layer==0){"
-            "for(uint capture_dim=tid;capture_dim<4096;capture_dim+=256)"
-            "stage_trace[13u*6144u+capture_dim]=q[capture_dim];"
-            "for(uint capture_dim=tid;capture_dim<512;capture_dim+=256)"
-            "stage_trace[14u*6144u+capture_dim]=k[capture_dim];"
-            "for(uint capture_dim=tid;capture_dim<512;capture_dim+=256)"
-            "stage_trace[15u*6144u+capture_dim]=v[capture_dim];}\n"
-            "        SYNC();\n"
-            "        for(uint member=kv_member;member<10;member+="
-        )
-        source = source.replace(projection_anchor, raw_projection_capture, 1)
-
     trace_store = "if(group==0)trace[(layer+1)*2048+i]=h[j];"
     if source.count(trace_store) != 2:
         raise ValueError(f"Expected two layer-output anchors, found {source.count(trace_store)}")
@@ -364,7 +344,7 @@ def make_single_head_projection_kernel(specification, metal):
     return metal(name="flint_independent_head_projection", **options)
 
 
-def validate_layer0_stages(engine, model, captured_stages, projection_kernel, *, capture_raw=True):
+def validate_layer0_stages(engine, model, captured_stages, projection_kernel):
     prompt, token = [1], 150006
     session = engine.make_session(max_new_tokens=2)
     native_session = engine.make_session(max_new_tokens=2)
@@ -379,32 +359,6 @@ def validate_layer0_stages(engine, model, captured_stages, projection_kernel, *,
     engine.forward(session._state, token)
     stages = captured_stages["values"]
     mx.eval(stages)
-    if capture_raw:
-        raw_value = stages[15, :512]
-        final_value = stages[12, :512]
-        capture_difference = raw_value != final_value
-        capture_unequal = int(mx.sum(capture_difference).item())
-        raw_values, final_values = raw_value.tolist(), final_value.tolist()
-        mismatch_indices = [
-            index for index, (raw, final) in enumerate(zip(raw_values, final_values, strict=True))
-            if raw != final
-        ]
-        print(
-            json.dumps(
-                dict(
-                    stage_capture_check="raw_value_vs_final_value",
-                    exact=capture_unequal == 0,
-                    unequal=capture_unequal,
-                    unequal_by_head=mx.sum(capture_difference.reshape(-1, 128), axis=1).tolist(),
-                    first_mismatches=[
-                        dict(index=index, raw=raw_values[index], final=final_values[index])
-                        for index in mismatch_indices[:8]
-                    ],
-                )
-            ),
-            flush=True,
-        )
-
     layer = model.native.layers[0]
     hidden = model.native.model.embed_tokens(mx.array([[token]], mx.int32))
     input_norm = layer.input_layernorm(hidden)
@@ -467,14 +421,6 @@ def validate_layer0_stages(engine, model, captured_stages, projection_kernel, *,
         flush=True,
     )
     references = [("input_norm", 0, input_norm)]
-    if capture_raw:
-        references.extend(
-            (
-                ("raw_query", 13, raw_query.transpose(0, 2, 1, 3).reshape(batch, length, -1)),
-                ("raw_key", 14, raw_keys.transpose(0, 2, 1, 3)),
-                ("raw_value", 15, raw_values.transpose(0, 2, 1, 3)),
-            )
-        )
     references.extend(
         (
             ("query", 10, query),
@@ -580,20 +526,14 @@ def main():
 
         def capture_stages(*call_args, **call_kwargs):
             call_kwargs = dict(call_kwargs)
-            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (16, 6144)]
+            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (13, 6144)]
             call_kwargs["output_dtypes"] = [*call_kwargs["output_dtypes"], mx.bfloat16]
             outputs = stage_kernel(*call_args, **call_kwargs)
             captured_stages["values"] = outputs[-1]
             return outputs[:-1]
 
         engine.kernel = capture_stages
-        validate_layer0_stages(
-            engine,
-            model,
-            captured_stages,
-            projection_kernel,
-            capture_raw=not args.qkv_single_owner,
-        )
+        validate_layer0_stages(engine, model, captured_stages, projection_kernel)
         return
     if args.sustained_steps:
         validate_sustained_native(
