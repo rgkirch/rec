@@ -250,3 +250,5 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** Changing the per-head inner projection from `q4_local` to `q4_local_block` does not resolve the K error. Both single-owner variants interleave projection and normalization/cache publication per head. The remaining issue may be in that sequencing or K publication rather than the projection arithmetic.
 
 **Next probe:** Add a test-only two-phase QKV schedule: compute all assigned Q/K/V heads first, perform a global barrier, then normalize Q/K and publish K/V. This isolates projection completion from normalization/publication before changing the runtime transform.
+
+**Implementation:** Added `--qkv-two-phase`, using per-group `q4_local_block` work followed by a global barrier before Q/K normalization and KV publication. It changes only the instrumented test kernel. Static checks and M1 control run are pending.
