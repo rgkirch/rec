@@ -116,3 +116,13 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** The 8-worker control validates the stage capture and native attention reference for this path. The 12-worker fault occurs before O projection, in Q/K/V production or attention computation/merge. The precise operation remains unknown.
 
 **Next probe:** Added captures for normalized Q, K, and V (after the global post-attention barrier) to distinguish projection/cache publication from attention partial/merge. The source compiles as Python; the expanded Metal probe is pending.
+
+### 2026-10-27 — Q/K/V projection mismatch at 12 workers
+
+**Procedure:** Ran the Q/K/V stage probe at 12/8/8 and then at 8/8/8 as a control.
+
+**Results:** At 12/8/8, input normalization matched exactly, while normalized Q had 1,344/4,096 unequal values (max absolute difference 6.640625), K had 160/512 (5.65625), and V had 76/512 (1.8515625). The merged attention vector also differed (2,046/4,096; 2.703125). At 8/8/8, Q, K, V, attention core/output, residual, and every dense MLP stage matched native exactly.
+
+**Interpretation:** The 12-worker error is present in Q/K/V production before attention computation, not just in attention merge or O projection. The 8-worker control validates the new Q/K/V captures and native reference. The shared projection's three-group KV-team mapping is the leading area to inspect; the exact failure mechanism is not established.
+
+**Next probe:** Report Q/K/V mismatches by head to determine whether corruption follows a specific KV team or is distributed across all teams.
