@@ -290,6 +290,20 @@ def instrument_stage_kernel(
             f"stage_trace[{slot}u*{width}u+capture_i]=h[capture_j];}}}}"
         )
 
+    worker_input_capture = (
+        "if(layer==0){for(uint capture_j=0;capture_j<8;++capture_j){"
+        "uint capture_i=(tid+(capture_j/4)*256)*4+capture_j%4;"
+        "worker_trace[group*4096u+capture_i]=h[capture_j];}}"
+    )
+    worker_norm_capture = (
+        "if(layer==0)for(uint capture_i=tid;capture_i<2048;capture_i+=256)"
+        "worker_trace[group*4096u+2048u+capture_i]=n[capture_i];"
+    )
+    rms_anchor = "        {rms_256_w4(h,(const device bfloat16_t*)(bank+d[3]),n,"
+    if source.count(rms_anchor) != 1:
+        raise ValueError(f"Expected one layer input-normalization anchor, found {source.count(rms_anchor)}")
+    source = source.replace(rms_anchor, worker_input_capture + rms_anchor, 1)
+
     if two_phase_qkv:
         marker = "__QKV_RAW_CAPTURE__"
         if source.count(marker) != 1:
@@ -312,7 +326,7 @@ def instrument_stage_kernel(
     source = insert_after_call(
         source,
         "rms_256_w4(h,(const device bfloat16_t*)(bank+d[3]),n,",
-        store_vector(0, "n", 2048),
+        store_vector(0, "n", 2048) + worker_norm_capture,
     )
     source = insert_after_call(
         source,
@@ -370,7 +384,7 @@ def instrument_stage_kernel(
     )
 
     options["source"] = source
-    options["output_names"] = [*options["output_names"], "stage_trace"]
+    options["output_names"] = [*options["output_names"], "stage_trace", "worker_trace"]
     return metal(name="flint_decode_stage_probe", **options)
 
 
@@ -429,6 +443,24 @@ def validate_layer0_stages(
     layer = model.native.layers[0]
     hidden = model.native.model.embed_tokens(mx.array([[token]], mx.int32))
     input_norm = layer.input_layernorm(hidden)
+    worker_states = captured_stages["workers"]
+    mx.eval(worker_states)
+    worker_results = []
+    for group in range(worker_states.shape[0]):
+        for name, offset, reference in (
+            ("hidden", 0, hidden.reshape(-1)),
+            ("input_norm", 2048, input_norm.reshape(-1)),
+        ):
+            expected = reference.reshape(-1)
+            actual = worker_states[group, offset : offset + expected.size]
+            unequal = int(mx.sum(actual != expected).item())
+            max_abs = float(
+                mx.max(mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))).item()
+            )
+            worker_results.append(
+                dict(group=group, stage=name, exact=unequal == 0, unequal=unequal, max_abs=max_abs)
+            )
+    print(json.dumps(dict(stage="per_worker_inputs", results=worker_results)), flush=True)
     attention_module = layer.self_attn
     batch, length, _hidden = input_norm.shape
     raw_query = attention_module.q_proj(input_norm).reshape(
@@ -685,11 +717,20 @@ def main():
 
         def capture_stages(*call_args, **call_kwargs):
             call_kwargs = dict(call_kwargs)
-            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (16, 6144)]
-            call_kwargs["output_dtypes"] = [*call_kwargs["output_dtypes"], mx.bfloat16]
+            call_kwargs["output_shapes"] = [
+                *call_kwargs["output_shapes"],
+                (16, 6144),
+                (args.workers, 4096),
+            ]
+            call_kwargs["output_dtypes"] = [
+                *call_kwargs["output_dtypes"],
+                mx.bfloat16,
+                mx.bfloat16,
+            ]
             outputs = stage_kernel(*call_args, **call_kwargs)
-            captured_stages["values"] = outputs[-1]
-            return outputs[:-1]
+            captured_stages["values"] = outputs[-2]
+            captured_stages["workers"] = outputs[-1]
+            return outputs[:-2]
 
         engine.kernel = capture_stages
         validate_layer0_stages(

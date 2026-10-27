@@ -276,3 +276,5 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** The mismatch exists before Q/K normalization and KV publication in this test schedule. The raw snapshot is validated by the exact 8-worker control and its explicit global barriers. Need still distinguish per-group input state from Q4 work execution.
 
 **Next probe:** Capture the pre-normalized hidden input and normalized `n` tensor separately for each of the 12 threadgroups at layer 0. Compare every group against native to see whether groups that own the divergent heads already have different inputs.
+
+**Implementation:** Added a test-only `worker_trace` output recording layer-0 hidden input and normalized `n` for each resident group. It is independent of the QKV schedule variant and leaves runtime code unchanged. Python/static checks pass; run the 8-worker control before interpreting 12-worker values.
