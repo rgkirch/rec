@@ -194,3 +194,13 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Observation:** The first run stopped before the independent Metal kernel was invoked with `ValueError: Invalid type list received in array initialization`. The helper passed `engine.metadata`, which is the Python metadata list, rather than the per-session MLX `uint32` metadata array.
 
 **Correction:** Pass `native_session._state["metadata"]` to the kernel. No independent-projection result was produced by the failed attempt.
+
+### 2026-10-27 — Independent per-head Q/K/V check
+
+**Procedure:** Ran the independent one-threadgroup-per-head projection kernel at 8/8/8 and 12/8/8, using the packed layer-0 matrices and native input normalization.
+
+**Results:** All 40 independent Q/K/V heads matched native exactly at both worker settings. At 8/8/8, the full instrumented layer-0 stages also matched native exactly. At 12/8/8, the full resident path still had normalized Q=1,408/4,096 and K=128/512 mismatches; V differed in 4/512, and downstream attention/MLP stages diverged. The raw snapshot invariant remained broken, so raw-stage counts are not used.
+
+**Interpretation:** The packed weights, per-head Q4 projection arithmetic, and per-head normalization can match native outside the resident shared-projection schedule. The 12-worker failure is in that schedule's coordination/partitioning or publication path, not a general inability to compute those heads. This does not identify the exact shared-path defect.
+
+**Next probe:** Run a test-only alternate QKV schedule in which each resident group owns complete heads using `q4_local`, followed by a global barrier. This will test whether avoiding the shared ticket queue restores 12/8/8 parity without changing production code.
