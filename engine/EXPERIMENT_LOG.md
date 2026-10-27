@@ -126,3 +126,13 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** The 12-worker error is present in Q/K/V production before attention computation, not just in attention merge or O projection. The 8-worker control validates the new Q/K/V captures and native reference. The shared projection's three-group KV-team mapping is the leading area to inspect; the exact failure mechanism is not established.
 
 **Next probe:** Report Q/K/V mismatches by head to determine whether corruption follows a specific KV team or is distributed across all teams. The diagnostic now emits per-head mismatch counts; its run is pending.
+
+### 2026-10-27 — Per-head Q/K/V mismatch pattern
+
+**Procedure:** Repeated the 12/8/8 stage diagnostic with per-head mismatch reporting. The kernel instrumentation was unchanged from the previous 12-worker Q/K/V run; only the Python summary changed.
+
+**Results:** This run had 1,536 unequal Q values (previous run: 1,344), 192 unequal K values (previous: 160), and 80 unequal V values (previous: 76). In this run, Q heads 0–17 matched and heads 18–31 differed; K heads 0–1 matched, head 2 differed completely, and head 3 differed partially; V heads 0–1 matched, head 2 differed partially, and head 3 differed completely.
+
+**Interpretation:** Q/K/V corruption is run-variable, and this sample's errors cluster in later head indices. That pattern is not stable enough to identify a single KV team as the cause. The changing totals are consistent with a race or incomplete work distribution, but do not prove which mechanism.
+
+**Next probe:** Repeat 12/8/8 again with the same instrumented shader and compare per-head patterns before changing the shared projection implementation.
