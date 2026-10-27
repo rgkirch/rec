@@ -66,3 +66,11 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Result:** Exact native layer-trace parity failed at repeat 1, step 1. The initial harness stopped at that assertion before checking logits and did not print per-layer differences. No sustained result or throughput measurement was obtained.
 
 **Interpretation:** This is a real post-RMW correctness failure for the tested 12/8/8 path, not evidence that every 12-worker schedule fails. The mismatching trace row and stage are not yet known. The next harness revision will report per-row differences and logits before stopping.
+
+### 2026-10-27 — 12/8/8 first-divergence diagnosis
+
+**Steps:** Repeated the same 2-step smoke test with the diagnostic harness at Rec commit `9e18f51`.
+
+**Results:** At step 1, the embedding trace row matched exactly. The first divergent row was row 1 (layer 0): 2,044 of 2,048 values differed, with maximum absolute difference 0.18579. The remaining layer rows also differed; final logits differed in 148,942 values, maximum absolute difference 19.8828. The run stopped at step 1, so no sustained-decode result exists.
+
+**Interpretation:** The error begins within the first model layer, not in token embedding or sampling. The probe does not identify which layer-0 operation is responsible. Before attributing this solely to the 12-worker kernel, run the same harness at the validated 8/8/8 profile as a control.
