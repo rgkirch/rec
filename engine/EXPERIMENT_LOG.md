@@ -240,3 +240,13 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Next probe:** Add a second test-only schedule that assigns complete heads per group but computes each head with the independently validated `q4_local_block` path. Compare all stages at 12/8/8 before considering any runtime change.
 
 **Implementation:** Added `--qkv-single-owner-block` alongside the earlier `q4_local` variant. This changes only the captured diagnostic shader, not `kv_teams.py` or the M1 profile. Python compilation and CLI validation are pending before its first M1 run.
+
+### 2026-10-27 — Block-based single-owner QKV result
+
+**Procedure:** Ran the `q4_local_block` single-owner variant at 8/8/8 and 12/8/8, with the independent one-head check.
+
+**Results:** At 8/8/8, all stages matched native exactly. At 12/8/8, the independent per-head kernel still matched all 40 heads; the single-owner block path produced exact Q and V but K differed in 192/512 values (heads 0:96, 1:32, 2:32, 3:32). Attention and later stages diverged.
+
+**Interpretation:** Changing the per-head inner projection from `q4_local` to `q4_local_block` does not resolve the K error. Both single-owner variants interleave projection and normalization/cache publication per head. The remaining issue may be in that sequencing or K publication rather than the projection arithmetic.
+
+**Next probe:** Add a test-only two-phase QKV schedule: compute all assigned Q/K/V heads first, perform a global barrier, then normalize Q/K and publish K/V. This isolates projection completion from normalization/publication before changing the runtime transform.
