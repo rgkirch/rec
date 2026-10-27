@@ -296,7 +296,40 @@ def instrument_stage_kernel(specification, metal):
     return metal(name="flint_decode_stage_probe", **options)
 
 
-def validate_layer0_stages(engine, model, captured_stages):
+def make_single_head_projection_kernel(specification, metal):
+    source = r"""
+    uint tid=thread_index_in_threadgroup;
+    uint lane=thread_index_in_simdgroup;
+    uint simd=simdgroup_index_in_threadgroup;
+    uint head=threadgroup_position_in_grid.x;
+    threadgroup bfloat16_t n[2048];
+    for(uint i=tid;i<2048;i+=256)n[i]=normalized[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const device uint* d=metadata;
+    Matrix m=weight_matrix(bank0,d+(head<32?10:head<36?15:20));
+    uint local=head<32?head:head<36?head-32:head-36;
+    m.w+=size_t(local)*128*1024;
+    m.s+=local*128*32;
+    m.b+=local*128*32;
+    m.n=128;
+    device bfloat16_t* out=projection+head*128;
+    for(uint block=simd;block<32;block+=8)
+        q4_local_block<2048>(m,n,out,lane,block*4);
+    threadgroup_barrier(mem_flags::mem_device);
+    if(simd==0&&head<36)
+        head_norm(out,(const device bfloat16_t*)(bank0+d[head<32?5:6]),1,false,0u,0.0f,1e-6f,lane,0);
+    threadgroup_barrier(mem_flags::mem_device);
+    """
+    options = dict(specification)
+    options.update(
+        input_names=["bank0", "metadata", "normalized"],
+        output_names=["projection"],
+        source=source,
+    )
+    return metal(name="flint_independent_head_projection", **options)
+
+
+def validate_layer0_stages(engine, model, captured_stages, projection_kernel):
     prompt, token = [1], 150006
     session = engine.make_session(max_new_tokens=2)
     native_session = engine.make_session(max_new_tokens=2)
@@ -370,6 +403,33 @@ def validate_layer0_stages(engine, model, captured_stages):
     activation = nn.silu(gate) * up
     down = layer.mlp.down_proj(activation)
     output = attention_residual + down
+    independent = projection_kernel(
+        inputs=[engine.banks[0], engine.metadata, input_norm.reshape(-1)],
+        grid=(40 * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(40, 128)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+    native_qkv = mx.concatenate(
+        (
+            query.reshape(32, 128),
+            new_keys.reshape(4, 128),
+            new_values.reshape(4, 128),
+        ),
+        axis=0,
+    )
+    mx.eval(independent, native_qkv)
+    independent_unequal = mx.sum(independent != native_qkv, axis=1).tolist()
+    print(
+        json.dumps(
+            dict(
+                stage="independent_qkv",
+                exact=not any(independent_unequal),
+                unequal_by_head=independent_unequal,
+            )
+        ),
+        flush=True,
+    )
     references = (
         ("input_norm", 0, input_norm),
         ("raw_query", 13, raw_query.transpose(0, 2, 1, 3).reshape(batch, length, -1)),
@@ -458,6 +518,7 @@ def main():
     print("profile:", engine.device_profile, flush=True)
     if args.stage_diagnostics:
         stage_kernel = instrument_stage_kernel(specification, metal)
+        projection_kernel = make_single_head_projection_kernel(specification, metal)
         captured_stages = {}
 
         def capture_stages(*call_args, **call_kwargs):
@@ -469,7 +530,7 @@ def main():
             return outputs[:-1]
 
         engine.kernel = capture_stages
-        validate_layer0_stages(engine, model, captured_stages)
+        validate_layer0_stages(engine, model, captured_stages, projection_kernel)
         return
     if args.sustained_steps:
         validate_sustained_native(

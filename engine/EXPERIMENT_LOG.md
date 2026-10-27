@@ -186,3 +186,5 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** Even a single-group raw snapshot is unreliable in this 12-worker diagnostic, so its raw Q/K/V figures remain unusable. The inserted global barriers also change scheduling. The native mismatch in normalized Q/K remains, but this instrumentation does not identify whether the fault is in Q4 task distribution, head normalization, or KV publication.
 
 **Next probe:** Build an independent one-threadgroup-per-head Q/K/V projection check using the packed layer-0 weights and native input normalization. This bypasses the 12-worker shared projection queue and head partitioning, and can determine whether the packed matrix math/head normalization are sound outside that path.
+
+**Implementation:** Added a test-only kernel that assigns one threadgroup to each of the 40 Q/K/V heads, uses `q4_local_block` plus the corresponding Q/K normalization, and compares the packed-weight result to native MLX. Python compilation passes; the Metal kernel has not yet been compiled or run.
