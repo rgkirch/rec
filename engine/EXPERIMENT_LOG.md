@@ -82,3 +82,11 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Results:** Both decode steps passed exact native parity for all layer traces and logits. The output reported two native layer checks and no diagnostics.
 
 **Interpretation:** The focused harness and fixed-token/native-cache comparison pass at the known-good 8/8/8 profile. The 12/8/8 failure is therefore specific to the changed resident-worker configuration under this test; its first divergent kernel stage remains unknown.
+
+### 2026-10-27 — Layer-0 stage diagnostic added
+
+**Question:** Which layer-0 operation first diverges at 12/8/8?
+
+**Steps:** Added a diagnostic mode to the existing project validator. It builds an instrumented copy of the captured decode shader, captures layer-0 input normalization, attention output/residual, post-attention normalization, dense gate/up/activation/down, and final layer output, then compares those arrays with native MLX intermediates. The instrumentation is test-only and does not alter the checked-in runtime kernel or default profile.
+
+**Checks:** Python compilation, CLI help, the M1 profile routing test, the BF16 expert-reduction test, and `git diff --check` passed. The instrumented shader has not yet been compiled or run.

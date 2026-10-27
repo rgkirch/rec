@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm.sample_utils import make_sampler
 from transformers import AutoTokenizer
 
@@ -186,6 +187,141 @@ def validate_sustained_native(engine, model, steps, repeats):
     return results
 
 
+def instrument_stage_kernel(specification, metal):
+    options = dict(specification)
+    source = options["source"]
+    width = 6144
+
+    def store_vector(slot, name, size):
+        return (
+            f"if(group==0&&layer==0){{for(uint capture_i=tid;capture_i<{size};capture_i+=256)"
+            f"stage_trace[{slot}u*{width}u+capture_i]={name}[capture_i];}}"
+        )
+
+    def store_hidden(slot):
+        return (
+            f"if(group==0&&layer==0){{for(uint capture_j=0;capture_j<8;++capture_j){{"
+            "uint capture_i=(tid+(capture_j/4)*256)*4+capture_j%4;"
+            f"stage_trace[{slot}u*{width}u+capture_i]=h[capture_j];}}}}"
+        )
+
+    def insert_after_call(text, prefix, addition):
+        if text.count(prefix) != 1:
+            raise ValueError(f"Expected one stage anchor, found {text.count(prefix)}: {prefix}")
+        start = text.index(prefix)
+        end = text.index(");", start) + 2
+        return text[:end] + addition + text[end:]
+
+    source = insert_after_call(
+        source,
+        "rms_256_w4(h,(const device bfloat16_t*)(bank+d[3]),n,",
+        store_vector(0, "n", 2048),
+    )
+    source = insert_after_call(
+        source,
+        "rms_256_w4(h,(const device bfloat16_t*)(bank+d[4]),n,",
+        store_vector(3, "n", 2048),
+    )
+
+    o_start = source.index("q4<4096>(weight_matrix(bank,d+25),a,o,lane,sg,")
+    o_sync = source.index("SYNC();", o_start) + len("SYNC();")
+    source = source[:o_sync] + store_vector(1, "o", 2048) + source[o_sync:]
+
+    residual = (
+        "for(uint j=0;j<8;++j){uint i=(tid+(j/4)*256)*4+j%4;"
+        "h[j]=bfloat16_t(float(h[j])+float(o[i]));}\n"
+    )
+    if source.count(residual) != 1:
+        raise ValueError(f"Expected one attention-residual anchor, found {source.count(residual)}")
+    source = source.replace(residual, residual + store_hidden(2), 1)
+
+    gate_up_sync = "SYNC();\n            for(uint i=index;i<gm.n;"
+    if source.count(gate_up_sync) != 1:
+        raise ValueError(f"Expected one dense gate/up anchor, found {source.count(gate_up_sync)}")
+    source = source.replace(
+        gate_up_sync,
+        "SYNC();\n            "
+        + store_vector(4, "gate", 6144)
+        + store_vector(5, "up", 6144)
+        + "for(uint i=index;i<gm.n;",
+        1,
+    )
+
+    down_start = source.index("q4<6144>(dm,act,down,lane,sg,")
+    activation_sync = source.rfind("SYNC();", 0, down_start) + len("SYNC();")
+    source = source[:activation_sync] + store_vector(6, "act", 6144) + source[activation_sync:]
+    down_sync = source.index("SYNC();", down_start) + len("SYNC();")
+    source = source[:down_sync] + store_vector(7, "down", 2048) + source[down_sync:]
+
+    trace_store = "if(group==0)trace[(layer+1)*2048+i]=h[j];"
+    if source.count(trace_store) != 2:
+        raise ValueError(f"Expected two layer-output anchors, found {source.count(trace_store)}")
+    source = source.replace(
+        trace_store,
+        "if(group==0&&layer==0)stage_trace[8u*6144u+i]=h[j];" + trace_store,
+    )
+
+    options["source"] = source
+    options["output_names"] = [*options["output_names"], "stage_trace"]
+    options["output_shapes"] = [*options["output_shapes"], (9, width)]
+    options["output_dtypes"] = [*options["output_dtypes"], mx.bfloat16]
+    return metal(name="flint_decode_stage_probe", **options)
+
+
+def validate_layer0_stages(engine, model, captured_stages):
+    prompt, token = [1], 150006
+    session = engine.make_session(max_new_tokens=2)
+    native_session = engine.make_session(max_new_tokens=2)
+    session.prefill(prompt)
+    native_session.prefill(prompt)
+    assert same_kv(session._state["kv"], native_session._state["kv"]), "Prefill KV differs"
+    native_cache = native_session.prompt_cache.layers
+    for row, cache in zip(engine.metadata[:49], native_cache, strict=True):
+        if not row[1]:
+            cache.grow(len(prompt) + 2)
+
+    engine.forward(session._state, token)
+    stages = captured_stages["values"]
+    mx.eval(stages)
+
+    layer = model.native.layers[0]
+    hidden = model.native.model.embed_tokens(mx.array([[token]], mx.int32))
+    input_norm = layer.input_layernorm(hidden)
+    attention = layer.self_attn(input_norm, None, native_cache[0])
+    attention_residual = hidden + attention
+    mlp_input = layer.post_attention_layernorm(attention_residual)
+    gate = layer.mlp.gate_proj(mlp_input)
+    up = layer.mlp.up_proj(mlp_input)
+    activation = nn.silu(gate) * up
+    down = layer.mlp.down_proj(activation)
+    output = attention_residual + down
+    references = (
+        ("input_norm", input_norm),
+        ("attention_output", attention),
+        ("attention_residual", attention_residual),
+        ("post_attention_norm", mlp_input),
+        ("gate", gate),
+        ("up", up),
+        ("activation", activation),
+        ("down", down),
+        ("layer_output", output),
+    )
+    results = []
+    for index, (name, reference) in enumerate(references):
+        expected = reference.reshape(-1)
+        actual = stages[index, : expected.size].reshape(expected.shape)
+        unequal = int(mx.sum(actual != expected).item())
+        max_abs = float(
+            mx.max(mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))).item()
+        )
+        row = dict(stage=name, exact=unequal == 0, unequal=unequal, max_abs=max_abs)
+        results.append(row)
+        print(json.dumps(row), flush=True)
+    first = next((row["stage"] for row in results if not row["exact"]), None)
+    print(json.dumps(dict(first_divergent_stage=first)), flush=True)
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True, help="Flint checkpoint directory")
@@ -202,9 +338,16 @@ def main():
         help="Run only repeated-token native parity for this many decode steps",
     )
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument(
+        "--stage-diagnostics",
+        action="store_true",
+        help="Compare layer-0 intermediate stages with native MLX and stop",
+    )
     args = parser.parse_args()
     if args.sustained_steps < 0 or args.repeats < 1:
         parser.error("--sustained-steps must be nonnegative and --repeats must be positive")
+    if args.stage_diagnostics and (args.workers is None or args.sustained_steps):
+        parser.error("--stage-diagnostics requires --workers and cannot be combined with --sustained-steps")
     if args.workers is not None:
         from dataclasses import replace
 
@@ -228,6 +371,18 @@ def main():
     megakernel._metal = capture_specification
     engine, resident = build_decoder(model, optimized=True)
     print("profile:", engine.device_profile, flush=True)
+    if args.stage_diagnostics:
+        stage_kernel = instrument_stage_kernel(specification, metal)
+        captured_stages = {}
+
+        def capture_stages(*call_args, **call_kwargs):
+            outputs = stage_kernel(*call_args, **call_kwargs)
+            captured_stages["values"] = outputs[-1]
+            return outputs[:-1]
+
+        engine.kernel = capture_stages
+        validate_layer0_stages(engine, model, captured_stages)
+        return
     if args.sustained_steps:
         validate_sustained_native(
             engine, model, args.sustained_steps, args.repeats
