@@ -251,4 +251,14 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Next probe:** Add a test-only two-phase QKV schedule: compute all assigned Q/K/V heads first, perform a global barrier, then normalize Q/K and publish K/V. This isolates projection completion from normalization/publication before changing the runtime transform.
 
-**Implementation:** Added `--qkv-two-phase`, using per-group `q4_local_block` work followed by a global barrier before Q/K normalization and KV publication. It changes only the instrumented test kernel. Static checks and M1 control run are pending.
+**Implementation:** Added `--qkv-two-phase`, using per-group `q4_local_block` work followed by a global barrier before Q/K normalization and KV publication. It changes only the instrumented test kernel.
+
+### 2026-10-27 — Two-phase QKV diagnostic result
+
+**Procedure:** Ran the two-phase schedule at 8/8/8 and 12/8/8. It computes each assigned head with `q4_local_block`, globally synchronizes, then normalizes Q/K and publishes K/V.
+
+**Results:** All captured stages matched native at 8/8/8. At 12/8/8, the independent per-head check remained exact, but the two-phase schedule had Q=1,024/4,096 mismatches, K=224/512, and exact V; attention and later stages diverged. This differs from the interleaved single-owner variant, which had exact Q/V but incorrect K.
+
+**Interpretation:** A global barrier before normalization/publication does not fix 12 workers; it changes which outputs diverge. That makes guessing from post-normalization captures insufficient. The two-phase variant now provides a clean point to compare raw projections before normalization.
+
+**Next probe:** After the projection global barrier, snapshot raw Q/K/V from group 0, synchronize again, then proceed with normalization. Compare those raw vectors directly to native projections; this separates projection work from head normalization/publication.
