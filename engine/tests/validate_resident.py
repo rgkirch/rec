@@ -264,17 +264,24 @@ def instrument_stage_kernel(specification, metal):
     down_sync = source.index("SYNC();", down_start) + len("SYNC();")
     source = source[:down_sync] + store_vector(7, "down", 2048) + source[down_sync:]
 
-    head_norm = "if(simdgroup_index_in_threadgroup==0 && head<36)"
-    if source.count(head_norm) != 1:
-        raise ValueError(f"Expected one shared Q/K normalization anchor, found {source.count(head_norm)}")
+    projection_anchor = "KV_TEAM_SYNC();\n        for(uint member=kv_member;member<10;member+="
+    if source.count(projection_anchor) != 1:
+        raise ValueError(
+            f"Expected one shared-projection snapshot anchor, found {source.count(projection_anchor)}"
+        )
     raw_projection_capture = (
-        "if(layer==0){for(uint capture_dim=tid;capture_dim<128;capture_dim+=256){"
-        "if(head<32)stage_trace[13u*6144u+head*128u+capture_dim]=out[capture_dim];"
-        "else if(head<36)stage_trace[14u*6144u+(head-32u)*128u+capture_dim]=out[capture_dim];"
-        "else stage_trace[15u*6144u+(head-36u)*128u+capture_dim]=out[capture_dim];}}"
-        "threadgroup_barrier(mem_flags::mem_device);"
+        "KV_TEAM_SYNC();\n        SYNC();\n"
+        "        if(group==0&&layer==0){"
+        "for(uint capture_dim=tid;capture_dim<4096;capture_dim+=256)"
+        "stage_trace[13u*6144u+capture_dim]=q[capture_dim];"
+        "for(uint capture_dim=tid;capture_dim<512;capture_dim+=256)"
+        "stage_trace[14u*6144u+capture_dim]=k[capture_dim];"
+        "for(uint capture_dim=tid;capture_dim<512;capture_dim+=256)"
+        "stage_trace[15u*6144u+capture_dim]=v[capture_dim];}\n"
+        "        SYNC();\n"
+        "        for(uint member=kv_member;member<10;member+="
     )
-    source = source.replace(head_norm, raw_projection_capture + head_norm, 1)
+    source = source.replace(projection_anchor, raw_projection_capture, 1)
 
     trace_store = "if(group==0)trace[(layer+1)*2048+i]=h[j];"
     if source.count(trace_store) != 2:

@@ -171,4 +171,8 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Results:** With the same 12/8/8 instrumented kernel, raw V differed from the later V buffer in 96 entries: 32 in KV head 2 and 64 in head 3. The first missing capture values were zeros while the later V buffer held nonzero values. The later V buffer still matched native exactly. The 8/8/8 raw-V invariant remained exact.
 
-**Interpretation:** The per-head raw capture itself fails to write some values in the 12-worker case; it cannot be treated as evidence that Rec's V projection is wrong. The stage data makes a concurrency/indexing flaw in the diagnostic visible. Replace concurrent per-head stores with a single-group snapshot bracketed by global barriers, then recheck the raw-V invariant before interpreting Q/K.
+**Interpretation:** The per-head raw capture itself fails to write some values in the 12-worker case; it cannot be treated as evidence that Rec's V projection is wrong. The stage data makes a concurrency/indexing flaw in the diagnostic visible.
+
+**Correction:** Replaced concurrent per-head stores with a group-0 snapshot of Q/K/V bracketed by global barriers after QKV projection and before normalization. This is instrumentation only and adds barriers to the diagnostic kernel; it does not modify the runtime kernel. The raw-V invariant remains in the report.
+
+**Next probe:** Run the corrected single-group snapshot at 8/8/8 and 12/8/8. Confirm raw V equals its later capture and the full 8-worker stage control remains exact before interpreting 12-worker raw Q/K.
