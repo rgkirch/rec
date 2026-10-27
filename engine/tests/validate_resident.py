@@ -264,6 +264,17 @@ def instrument_stage_kernel(specification, metal):
     down_sync = source.index("SYNC();", down_start) + len("SYNC();")
     source = source[:down_sync] + store_vector(7, "down", 2048) + source[down_sync:]
 
+    head_norm = "if(simdgroup_index_in_threadgroup==0 && head<36)"
+    if source.count(head_norm) != 1:
+        raise ValueError(f"Expected one shared Q/K normalization anchor, found {source.count(head_norm)}")
+    raw_projection_capture = (
+        "if(layer==0){for(uint capture_dim=tid;capture_dim<128;capture_dim+=256){"
+        "if(head<32)stage_trace[13u*6144u+head*128u+capture_dim]=out[capture_dim];"
+        "else if(head<36)stage_trace[14u*6144u+(head-32u)*128u+capture_dim]=out[capture_dim];"
+        "else stage_trace[15u*6144u+(head-36u)*128u+capture_dim]=out[capture_dim];}}"
+    )
+    source = source.replace(head_norm, raw_projection_capture + head_norm, 1)
+
     trace_store = "if(group==0)trace[(layer+1)*2048+i]=h[j];"
     if source.count(trace_store) != 2:
         raise ValueError(f"Expected two layer-output anchors, found {source.count(trace_store)}")
@@ -298,19 +309,18 @@ def validate_layer0_stages(engine, model, captured_stages):
     input_norm = layer.input_layernorm(hidden)
     attention_module = layer.self_attn
     batch, length, _hidden = input_norm.shape
-    query = attention_module.q_norm(
-        attention_module.q_proj(input_norm).reshape(
-            batch, length, attention_module.n_heads, attention_module.head_dim
-        )
-    ).transpose(0, 2, 1, 3)
-    new_keys = attention_module.k_norm(
-        attention_module.k_proj(input_norm).reshape(
-            batch, length, attention_module.n_kv, attention_module.head_dim
-        )
-    ).transpose(0, 2, 1, 3)
-    new_values = attention_module.v_proj(input_norm).reshape(
+    raw_query = attention_module.q_proj(input_norm).reshape(
+        batch, length, attention_module.n_heads, attention_module.head_dim
+    )
+    raw_keys = attention_module.k_proj(input_norm).reshape(
         batch, length, attention_module.n_kv, attention_module.head_dim
-    ).transpose(0, 2, 1, 3)
+    )
+    raw_values = attention_module.v_proj(input_norm).reshape(
+        batch, length, attention_module.n_kv, attention_module.head_dim
+    )
+    query = attention_module.q_norm(raw_query).transpose(0, 2, 1, 3)
+    new_keys = attention_module.k_norm(raw_keys).transpose(0, 2, 1, 3)
+    new_values = raw_values.transpose(0, 2, 1, 3)
     keys, values = native_cache[0].update_and_fetch(new_keys, new_values)
     attention_core = mx.fast.scaled_dot_product_attention(
         query,
@@ -330,6 +340,9 @@ def validate_layer0_stages(engine, model, captured_stages):
     output = attention_residual + down
     references = (
         ("input_norm", 0, input_norm),
+        ("raw_query", 13, raw_query.transpose(0, 2, 1, 3).reshape(batch, length, -1)),
+        ("raw_key", 14, raw_keys.transpose(0, 2, 1, 3)),
+        ("raw_value", 15, raw_values.transpose(0, 2, 1, 3)),
         ("query", 10, query),
         ("key", 11, new_keys),
         ("value", 12, new_values),
@@ -417,7 +430,7 @@ def main():
 
         def capture_stages(*call_args, **call_kwargs):
             call_kwargs = dict(call_kwargs)
-            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (13, 6144)]
+            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (16, 6144)]
             call_kwargs["output_dtypes"] = [*call_kwargs["output_dtypes"], mx.bfloat16]
             outputs = stage_kernel(*call_args, **call_kwargs)
             captured_stages["values"] = outputs[-1]

@@ -143,4 +143,4 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Interpretation:** Across the two per-head runs, corruption remains concentrated in later Q/K/V heads but individual values/head counts vary. This is evidence of nondeterministic corruption in the shared projection path, not a stable head-index mapping error. It still does not distinguish raw matrix projection from Q/K normalization or KV publication.
 
-**Next probe:** Capture the Q/K/V projection outputs before head normalization, then compare raw and normalized values separately.
+**Next probe:** Capture the Q/K/V projection outputs before head normalization, then compare raw and normalized values separately. The test-only shader instrumentation and native raw-projection references are implemented; Python compilation passes, and the M1 run is pending.
