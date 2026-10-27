@@ -226,7 +226,14 @@ def instrument_stage_kernel(specification, metal):
     o_start = source.index("q4<4096>(weight_matrix(bank,d+25),a,o,lane,sg,")
     o_sync = source.index("SYNC();", o_start) + len("SYNC();")
     a_sync = source.rfind("SYNC();", 0, o_start) + len("SYNC();")
-    source = source[:a_sync] + store_vector(9, "a", 4096) + source[a_sync:]
+    source = (
+        source[:a_sync]
+        + store_vector(9, "a", 4096)
+        + store_vector(10, "q", 4096)
+        + store_vector(11, "k", 512)
+        + store_vector(12, "v", 512)
+        + source[a_sync:]
+    )
     o_start = source.index("q4<4096>(weight_matrix(bank,d+25),a,o,lane,sg,")
     o_sync = source.index("SYNC();", o_start) + len("SYNC();")
     source = source[:o_sync] + store_vector(1, "o", 2048) + source[o_sync:]
@@ -296,15 +303,15 @@ def validate_layer0_stages(engine, model, captured_stages):
             batch, length, attention_module.n_heads, attention_module.head_dim
         )
     ).transpose(0, 2, 1, 3)
-    keys = attention_module.k_norm(
+    new_keys = attention_module.k_norm(
         attention_module.k_proj(input_norm).reshape(
             batch, length, attention_module.n_kv, attention_module.head_dim
         )
     ).transpose(0, 2, 1, 3)
-    values = attention_module.v_proj(input_norm).reshape(
+    new_values = attention_module.v_proj(input_norm).reshape(
         batch, length, attention_module.n_kv, attention_module.head_dim
     ).transpose(0, 2, 1, 3)
-    keys, values = native_cache[0].update_and_fetch(keys, values)
+    keys, values = native_cache[0].update_and_fetch(new_keys, new_values)
     attention_core = mx.fast.scaled_dot_product_attention(
         query,
         keys,
@@ -323,6 +330,9 @@ def validate_layer0_stages(engine, model, captured_stages):
     output = attention_residual + down
     references = (
         ("input_norm", 0, input_norm),
+        ("query", 10, query),
+        ("key", 11, new_keys),
+        ("value", 12, new_values),
         ("attention_core", 9, attention_core),
         ("attention_output", 1, attention),
         ("attention_residual", 2, attention_residual),
@@ -404,7 +414,7 @@ def main():
 
         def capture_stages(*call_args, **call_kwargs):
             call_kwargs = dict(call_kwargs)
-            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (10, 6144)]
+            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (13, 6144)]
             call_kwargs["output_dtypes"] = [*call_kwargs["output_dtypes"], mx.bfloat16]
             outputs = stage_kernel(*call_args, **call_kwargs)
             captured_stages["values"] = outputs[-1]

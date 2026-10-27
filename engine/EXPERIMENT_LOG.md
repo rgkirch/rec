@@ -114,3 +114,5 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Results:** At 8/8/8, all captured layer-0 stages—including the merged attention vector, attention output, and dense MLP intermediates—matched native MLX exactly. At 12/8/8, input normalization matched, but the merged attention vector first diverged (2,046 of 4,096 values; max absolute difference 2.703125). The attention output then differed in 2,047 of 2,048 values (max absolute difference 0.291015625).
 
 **Interpretation:** The 8-worker control validates the stage capture and native attention reference for this path. The 12-worker fault occurs before O projection, in Q/K/V production or attention computation/merge. The precise operation remains unknown.
+
+**Next probe:** Added captures for normalized Q, K, and V (after the global post-attention barrier) to distinguish projection/cache publication from attention partial/merge. The source compiles as Python; the expanded Metal probe is pending.
