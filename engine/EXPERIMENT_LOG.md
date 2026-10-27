@@ -204,3 +204,5 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** The packed weights, per-head Q4 projection arithmetic, and per-head normalization can match native outside the resident shared-projection schedule. The 12-worker failure is in that schedule's coordination/partitioning or publication path, not a general inability to compute those heads. This does not identify the exact shared-path defect.
 
 **Next probe:** Run a test-only alternate QKV schedule in which each resident group owns complete heads using `q4_local`, followed by a global barrier. This will test whether avoiding the shared ticket queue restores 12/8/8 parity without changing production code.
+
+**Implementation:** Added `--qkv-single-owner` to the stage diagnostic. It replaces only the test kernel's shared QKV queue with per-group full-head work and a global barrier; the checked-in runtime source/profile remain unchanged. Static Python compilation and CLI checks pass; Metal validation is pending.

@@ -187,9 +187,38 @@ def validate_sustained_native(engine, model, steps, repeats):
     return results
 
 
-def instrument_stage_kernel(specification, metal):
+def replace_shared_qkv_with_single_owner(source, workers):
+    start = source.index("uint kv_team=group/")
+    end = source.index("bool rounded=", start)
+    replacement = f"""for(uint work=group;work<40;work+={workers}) {{
+            uint head=work;
+            uint local=head<32?head:head<36?head-32:head-36;
+            Matrix m=weight_matrix(bank,d+(head<32?10:head<36?15:20));
+            m.w+=size_t(local)*128*1024;
+            m.s+=local*128*32;
+            m.b+=local*128*32;
+            m.n=128;
+            device bfloat16_t* out=(head<32?q:head<36?k:v)+local*128;
+            q4_local<2048>(m,n,out,lane,simdgroup_index_in_threadgroup,8);
+            threadgroup_barrier(mem_flags::mem_device);
+            if(simdgroup_index_in_threadgroup==0 && head<36)
+                head_norm(out,(const device bfloat16_t*)(bank+d[head<32?5:6]),1,!global,uint(position),__LOGBASE__,__EPS__,lane,0);
+            threadgroup_barrier(mem_flags::mem_device);
+            if(head>=32) {{
+                KVView target=head<36?keys:vals;
+                for(uint dim=tid;dim<128;dim+=256)target.store(local,insert,dim,out[dim]);
+            }}
+        }}
+        SYNC();
+        """
+    return source[:start] + replacement + source[end:]
+
+
+def instrument_stage_kernel(specification, metal, *, workers, single_owner_qkv=False):
     options = dict(specification)
     source = options["source"]
+    if single_owner_qkv:
+        source = replace_shared_qkv_with_single_owner(source, workers)
     width = 6144
 
     def store_vector(slot, name, size):
@@ -264,24 +293,25 @@ def instrument_stage_kernel(specification, metal):
     down_sync = source.index("SYNC();", down_start) + len("SYNC();")
     source = source[:down_sync] + store_vector(7, "down", 2048) + source[down_sync:]
 
-    projection_anchor = "KV_TEAM_SYNC();\n        for(uint member=kv_member;member<10;member+="
-    if source.count(projection_anchor) != 1:
-        raise ValueError(
-            f"Expected one shared-projection snapshot anchor, found {source.count(projection_anchor)}"
+    if not single_owner_qkv:
+        projection_anchor = "KV_TEAM_SYNC();\n        for(uint member=kv_member;member<10;member+="
+        if source.count(projection_anchor) != 1:
+            raise ValueError(
+                f"Expected one shared-projection snapshot anchor, found {source.count(projection_anchor)}"
+            )
+        raw_projection_capture = (
+            "KV_TEAM_SYNC();\n        SYNC();\n"
+            "        if(group==0&&layer==0){"
+            "for(uint capture_dim=tid;capture_dim<4096;capture_dim+=256)"
+            "stage_trace[13u*6144u+capture_dim]=q[capture_dim];"
+            "for(uint capture_dim=tid;capture_dim<512;capture_dim+=256)"
+            "stage_trace[14u*6144u+capture_dim]=k[capture_dim];"
+            "for(uint capture_dim=tid;capture_dim<512;capture_dim+=256)"
+            "stage_trace[15u*6144u+capture_dim]=v[capture_dim];}\n"
+            "        SYNC();\n"
+            "        for(uint member=kv_member;member<10;member+="
         )
-    raw_projection_capture = (
-        "KV_TEAM_SYNC();\n        SYNC();\n"
-        "        if(group==0&&layer==0){"
-        "for(uint capture_dim=tid;capture_dim<4096;capture_dim+=256)"
-        "stage_trace[13u*6144u+capture_dim]=q[capture_dim];"
-        "for(uint capture_dim=tid;capture_dim<512;capture_dim+=256)"
-        "stage_trace[14u*6144u+capture_dim]=k[capture_dim];"
-        "for(uint capture_dim=tid;capture_dim<512;capture_dim+=256)"
-        "stage_trace[15u*6144u+capture_dim]=v[capture_dim];}\n"
-        "        SYNC();\n"
-        "        for(uint member=kv_member;member<10;member+="
-    )
-    source = source.replace(projection_anchor, raw_projection_capture, 1)
+        source = source.replace(projection_anchor, raw_projection_capture, 1)
 
     trace_store = "if(group==0)trace[(layer+1)*2048+i]=h[j];"
     if source.count(trace_store) != 2:
@@ -329,7 +359,7 @@ def make_single_head_projection_kernel(specification, metal):
     return metal(name="flint_independent_head_projection", **options)
 
 
-def validate_layer0_stages(engine, model, captured_stages, projection_kernel):
+def validate_layer0_stages(engine, model, captured_stages, projection_kernel, *, capture_raw=True):
     prompt, token = [1], 150006
     session = engine.make_session(max_new_tokens=2)
     native_session = engine.make_session(max_new_tokens=2)
@@ -344,30 +374,31 @@ def validate_layer0_stages(engine, model, captured_stages, projection_kernel):
     engine.forward(session._state, token)
     stages = captured_stages["values"]
     mx.eval(stages)
-    raw_value = stages[15, :512]
-    final_value = stages[12, :512]
-    capture_difference = raw_value != final_value
-    capture_unequal = int(mx.sum(capture_difference).item())
-    raw_values, final_values = raw_value.tolist(), final_value.tolist()
-    mismatch_indices = [
-        index for index, (raw, final) in enumerate(zip(raw_values, final_values, strict=True))
-        if raw != final
-    ]
-    print(
-        json.dumps(
-            dict(
-                stage_capture_check="raw_value_vs_final_value",
-                exact=capture_unequal == 0,
-                unequal=capture_unequal,
-                unequal_by_head=mx.sum(capture_difference.reshape(-1, 128), axis=1).tolist(),
-                first_mismatches=[
-                    dict(index=index, raw=raw_values[index], final=final_values[index])
-                    for index in mismatch_indices[:8]
-                ],
-            )
-        ),
-        flush=True,
-    )
+    if capture_raw:
+        raw_value = stages[15, :512]
+        final_value = stages[12, :512]
+        capture_difference = raw_value != final_value
+        capture_unequal = int(mx.sum(capture_difference).item())
+        raw_values, final_values = raw_value.tolist(), final_value.tolist()
+        mismatch_indices = [
+            index for index, (raw, final) in enumerate(zip(raw_values, final_values, strict=True))
+            if raw != final
+        ]
+        print(
+            json.dumps(
+                dict(
+                    stage_capture_check="raw_value_vs_final_value",
+                    exact=capture_unequal == 0,
+                    unequal=capture_unequal,
+                    unequal_by_head=mx.sum(capture_difference.reshape(-1, 128), axis=1).tolist(),
+                    first_mismatches=[
+                        dict(index=index, raw=raw_values[index], final=final_values[index])
+                        for index in mismatch_indices[:8]
+                    ],
+                )
+            ),
+            flush=True,
+        )
 
     layer = model.native.layers[0]
     hidden = model.native.model.embed_tokens(mx.array([[token]], mx.int32))
@@ -430,23 +461,30 @@ def validate_layer0_stages(engine, model, captured_stages, projection_kernel):
         ),
         flush=True,
     )
-    references = (
-        ("input_norm", 0, input_norm),
-        ("raw_query", 13, raw_query.transpose(0, 2, 1, 3).reshape(batch, length, -1)),
-        ("raw_key", 14, raw_keys.transpose(0, 2, 1, 3)),
-        ("raw_value", 15, raw_values.transpose(0, 2, 1, 3)),
-        ("query", 10, query),
-        ("key", 11, new_keys),
-        ("value", 12, new_values),
-        ("attention_core", 9, attention_core),
-        ("attention_output", 1, attention),
-        ("attention_residual", 2, attention_residual),
-        ("post_attention_norm", 3, mlp_input),
-        ("gate", 4, gate),
-        ("up", 5, up),
-        ("activation", 6, activation),
-        ("down", 7, down),
-        ("layer_output", 8, output),
+    references = [("input_norm", 0, input_norm)]
+    if capture_raw:
+        references.extend(
+            (
+                ("raw_query", 13, raw_query.transpose(0, 2, 1, 3).reshape(batch, length, -1)),
+                ("raw_key", 14, raw_keys.transpose(0, 2, 1, 3)),
+                ("raw_value", 15, raw_values.transpose(0, 2, 1, 3)),
+            )
+        )
+    references.extend(
+        (
+            ("query", 10, query),
+            ("key", 11, new_keys),
+            ("value", 12, new_values),
+            ("attention_core", 9, attention_core),
+            ("attention_output", 1, attention),
+            ("attention_residual", 2, attention_residual),
+            ("post_attention_norm", 3, mlp_input),
+            ("gate", 4, gate),
+            ("up", 5, up),
+            ("activation", 6, activation),
+            ("down", 7, down),
+            ("layer_output", 8, output),
+        )
     )
     results = []
     for name, slot, reference in references:
@@ -488,11 +526,18 @@ def main():
         action="store_true",
         help="Compare layer-0 intermediate stages with native MLX and stop",
     )
+    parser.add_argument(
+        "--qkv-single-owner",
+        action="store_true",
+        help="In stage diagnostics, assign complete Q/K/V heads to resident groups",
+    )
     args = parser.parse_args()
     if args.sustained_steps < 0 or args.repeats < 1:
         parser.error("--sustained-steps must be nonnegative and --repeats must be positive")
     if args.stage_diagnostics and (args.workers is None or args.sustained_steps):
         parser.error("--stage-diagnostics requires --workers and cannot be combined with --sustained-steps")
+    if args.qkv_single_owner and not args.stage_diagnostics:
+        parser.error("--qkv-single-owner requires --stage-diagnostics")
     if args.workers is not None:
         from dataclasses import replace
 
@@ -517,7 +562,12 @@ def main():
     engine, resident = build_decoder(model, optimized=True)
     print("profile:", engine.device_profile, flush=True)
     if args.stage_diagnostics:
-        stage_kernel = instrument_stage_kernel(specification, metal)
+        stage_kernel = instrument_stage_kernel(
+            specification,
+            metal,
+            workers=args.workers,
+            single_owner_qkv=args.qkv_single_owner,
+        )
         projection_kernel = make_single_head_projection_kernel(specification, metal)
         captured_stages = {}
 
@@ -530,7 +580,13 @@ def main():
             return outputs[:-1]
 
         engine.kernel = capture_stages
-        validate_layer0_stages(engine, model, captured_stages, projection_kernel)
+        validate_layer0_stages(
+            engine,
+            model,
+            captured_stages,
+            projection_kernel,
+            capture_raw=not args.qkv_single_owner,
+        )
         return
     if args.sustained_steps:
         validate_sustained_native(
