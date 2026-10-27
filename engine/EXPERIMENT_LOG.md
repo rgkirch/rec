@@ -265,4 +265,14 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Implementation:** Extended only the `--qkv-two-phase` test shader with a group-0 raw Q/K/V snapshot between global barriers and raw-stage comparisons against native projections. The buffer now allocates slots 13–15 for those raw vectors. Also extended the independent one-head kernel to return its pre-normalization projections, so the fused schedule can be compared directly against the same Q4 computation rather than only native outputs.
 
-**Harness correction:** The first run after adding the second output assigned the returned raw and normalized arrays in reverse order. The raw stage snapshot itself matched native exactly at 8/8/8 and the full stages also passed, but the new independent-kernel comparisons from that invocation are invalid. Corrected the Python output ordering; rerun the independent comparisons at 8/8/8 and 12/8/8.
+**Harness correction:** The first run after adding the second output assigned the returned raw and normalized arrays in reverse order. The raw stage snapshot itself matched native exactly at 8/8/8 and the full stages also passed, but the new independent-kernel comparisons from that invocation are invalid. Corrected the Python output ordering.
+
+### 2026-10-27 — Two-phase raw projection comparison
+
+**Procedure:** Re-ran the two-phase diagnostic with the corrected raw/normalized output ordering at 8/8/8 and 12/8/8. The independent one-head kernel now returns both pre-normalization and normalized Q/K/V; the fused diagnostic captures its raw Q/K/V after a global barrier and before normalization.
+
+**Results:** At 8/8/8, independent raw and normalized outputs matched native exactly, the captured raw outputs matched the independent outputs exactly, and every full-path stage matched. At 12/8/8, both independent outputs still matched native exactly. The fused per-group raw result differed from the independent result in Q heads 22 and 23 (32/128 values each) and all four K heads (128/128 each); V was exact. The corresponding raw/native comparisons showed 64 Q, 512 K, and zero V unequal values. After normalization, Q had 1,024 mismatches, K 224, and V remained exact.
+
+**Interpretation:** The mismatch exists before Q/K normalization and KV publication in this test schedule. The raw snapshot is validated by the exact 8-worker control and its explicit global barriers. Need still distinguish per-group input state from Q4 work execution.
+
+**Next probe:** Capture the pre-normalized hidden input and normalized `n` tensor separately for each of the 12 threadgroups at layer 0. Compare every group against native to see whether groups that own the divergent heads already have different inputs.
