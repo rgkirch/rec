@@ -1,0 +1,42 @@
+# M1 Max Worker-Count Experiment Journal
+
+This is the working lab notebook for Recursive Flint resident-worker experiments on the M1 Max. It records hypotheses, procedures, observations, and conclusions; it is not a benchmark summary. Entries are chronological. Preserve failed and inconclusive results, and distinguish observations from interpretations. Correct the record with a dated follow-up rather than silently rewriting prior results.
+
+For each run, record the date, Rec commit and worktree state, exact `workers` / `mlp_workers` / `head_workers` profile, model and runtime identity, test procedure and input, repeat count, correctness/synchronization results, and phase-specific performance or memory results when measured. Record unknowns explicitly. Keep reusable test code in the existing test suite; do not create scattered run scripts or raw-log files.
+
+## 2026-10-27 — Seed record: existing evidence and 12-worker question
+
+This entry consolidates the experiment state available when this journal was created. It is a retrospective record; historical run timestamps and exact source revisions are included only where they were retained.
+
+### Current 8-worker baseline
+
+**Configuration:** M1 Max, `workers=8`, `mlp_workers=8`, `head_workers=8`; optimized resident decode; Flint INT4 checkpoint.
+
+**Steps and observations:**
+
+- Repeated the isolated 8-worker synchronization stress test five times. Each run exercised 256 global barriers and 512 KV-team barriers; all workers completed, with no diagnostics or payload mismatches.
+- Compared normal Engine greedy generation with native MLX. Both produced `[3157, 5586]` for the tested short generation.
+- Ran four warmups followed by 64 sequential decode-forward steps using a repeated input token. The run completed without a synchronization failure at 30.435 decode-forward tok/s. This is a diagnostic workload result, not a controlled benchmark or a coding-quality evaluation.
+
+**Interpretation:** The zero-increment atomic RMW polling change is validated for these 8-worker tests. The exact Metal/compiler cause is still unproven. This does not validate longer contexts, full 256K prefill, measured peak memory, or GPU saturation.
+
+**Code record:** The polling change and focused regression assertions are in Rec commit `155e4c5` (`Poll resident barriers with atomic read-modify-write`). The worktree was clean at journal creation.
+
+### Historical higher-worker probes
+
+These probes predate commit `155e4c5`; the higher counts have not been retested with the RMW polling change.
+
+- A temporary `16/16/16` override differed from native in 1,984–2,015 of 2,048 layer-0 values across runs. Stage probes found varying O-projection mismatches. Restricting O projection to eight groups made earlier stages exact in that probe, but activation still differed in 768–2,048 of 6,144 values across runs. The exact fault was not identified.
+- A temporary `32/32/32` override differed from native in 2,003–2,035 of 2,048 layer-0 values across five runs, with run-to-run variation. A stage probe with single-group O projection matched through attention and gate/up, then differed at activation and downstream. This localizes a symptom; it does not prove the underlying cause.
+- The checked-in expert-team transform supports MLP widths 8, 32, and 64, not 16. The M1 profile remains `8/8/8`; the 16/32 overrides are not checked-in M1 configurations.
+- Counts 9, 10, and 12 have no runtime correctness or performance results.
+
+Historical probe commands, exact timestamps, and source revisions for these higher-worker runs were not retained in the available record.
+
+### Next hypothesis to test
+
+**Hypothesis:** A resident `workers=12` schedule with `mlp_workers=8` and `head_workers=8` may be viable because the KV-team transform computes `groups = workers // 4 = 3`, mapping 12 groups into four teams of three. This arithmetic is only a structural rationale; it is not evidence of correct execution or useful speed.
+
+**Planned falsification:** Use the project-owned validation harness to compare native and Rec layer traces, logits, and KV state at 12 resident workers; repeat for determinism, then run sustained sequential decode. Measure throughput only after correctness and reliability pass. Keep the default M1 profile at `8/8/8` unless the evidence supports a separate profile change.
+
+**Open prerequisite:** The model and Python environment previously used for these experiments were located under `/tmp`. The user has directed that `/tmp` no longer be used. Before running the 12-worker validation, locate existing persistent model/environment assets; do not move, copy, or create large assets without direction.
