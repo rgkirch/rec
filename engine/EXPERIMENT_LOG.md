@@ -104,3 +104,5 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Results:** The input normalization matched exactly. The first mismatch was the attention output projection result: 2,043 of 2,048 values differed, with max absolute difference 0.291015625. Attention residual, post-attention normalization, dense gate/up/activation/down, and final layer output also differed, as expected downstream of that point.
 
 **Interpretation:** The first error occurs in the attention subsystem, before layer-0 MLP. This test does not yet distinguish Q/K/V or attention merge from the output projection.
+
+**Follow-up probe:** Extended the diagnostic to capture the merged attention vector before O projection and to compute the corresponding native Q/K/V, cache update, and attention output using the model's `Attention` implementation. Static compilation passes; this finer probe is pending.

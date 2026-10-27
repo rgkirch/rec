@@ -225,6 +225,10 @@ def instrument_stage_kernel(specification, metal):
 
     o_start = source.index("q4<4096>(weight_matrix(bank,d+25),a,o,lane,sg,")
     o_sync = source.index("SYNC();", o_start) + len("SYNC();")
+    a_sync = source.rfind("SYNC();", 0, o_start) + len("SYNC();")
+    source = source[:a_sync] + store_vector(9, "a", 4096) + source[a_sync:]
+    o_start = source.index("q4<4096>(weight_matrix(bank,d+25),a,o,lane,sg,")
+    o_sync = source.index("SYNC();", o_start) + len("SYNC();")
     source = source[:o_sync] + store_vector(1, "o", 2048) + source[o_sync:]
 
     residual = (
@@ -285,7 +289,31 @@ def validate_layer0_stages(engine, model, captured_stages):
     layer = model.native.layers[0]
     hidden = model.native.model.embed_tokens(mx.array([[token]], mx.int32))
     input_norm = layer.input_layernorm(hidden)
-    attention = layer.self_attn(input_norm, None, native_cache[0])
+    attention_module = layer.self_attn
+    batch, length, _hidden = input_norm.shape
+    query = attention_module.q_norm(
+        attention_module.q_proj(input_norm).reshape(
+            batch, length, attention_module.n_heads, attention_module.head_dim
+        )
+    ).transpose(0, 2, 1, 3)
+    keys = attention_module.k_norm(
+        attention_module.k_proj(input_norm).reshape(
+            batch, length, attention_module.n_kv, attention_module.head_dim
+        )
+    ).transpose(0, 2, 1, 3)
+    values = attention_module.v_proj(input_norm).reshape(
+        batch, length, attention_module.n_kv, attention_module.head_dim
+    ).transpose(0, 2, 1, 3)
+    keys, values = native_cache[0].update_and_fetch(keys, values)
+    attention_core = mx.fast.scaled_dot_product_attention(
+        query,
+        keys,
+        values,
+        scale=attention_module.scale,
+        mask=None,
+        sinks=attention_module.softmax_offset.astype(query.dtype),
+    ).transpose(0, 2, 1, 3).reshape(batch, length, -1)
+    attention = attention_module.o_proj(attention_core)
     attention_residual = hidden + attention
     mlp_input = layer.post_attention_layernorm(attention_residual)
     gate = layer.mlp.gate_proj(mlp_input)
@@ -294,20 +322,21 @@ def validate_layer0_stages(engine, model, captured_stages):
     down = layer.mlp.down_proj(activation)
     output = attention_residual + down
     references = (
-        ("input_norm", input_norm),
-        ("attention_output", attention),
-        ("attention_residual", attention_residual),
-        ("post_attention_norm", mlp_input),
-        ("gate", gate),
-        ("up", up),
-        ("activation", activation),
-        ("down", down),
-        ("layer_output", output),
+        ("input_norm", 0, input_norm),
+        ("attention_core", 9, attention_core),
+        ("attention_output", 1, attention),
+        ("attention_residual", 2, attention_residual),
+        ("post_attention_norm", 3, mlp_input),
+        ("gate", 4, gate),
+        ("up", 5, up),
+        ("activation", 6, activation),
+        ("down", 7, down),
+        ("layer_output", 8, output),
     )
     results = []
-    for index, (name, reference) in enumerate(references):
+    for name, slot, reference in references:
         expected = reference.reshape(-1)
-        actual = stages[index, : expected.size].reshape(expected.shape)
+        actual = stages[slot, : expected.size].reshape(expected.shape)
         unequal = int(mx.sum(actual != expected).item())
         max_abs = float(
             mx.max(mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))).item()
@@ -375,7 +404,7 @@ def main():
 
         def capture_stages(*call_args, **call_kwargs):
             call_kwargs = dict(call_kwargs)
-            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (9, 6144)]
+            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (10, 6144)]
             call_kwargs["output_dtypes"] = [*call_kwargs["output_dtypes"], mx.bfloat16]
             outputs = stage_kernel(*call_args, **call_kwargs)
             captured_stages["values"] = outputs[-1]
