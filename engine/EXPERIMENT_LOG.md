@@ -238,3 +238,5 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Observation:** The test-only per-group `q4_local` schedule at 12/8/8 made normalized Q and V exact but left K incorrect; the independent one-head check uses `q4_local_block` and matched all heads. This leaves room for a per-group `q4_local_block` schedule to eliminate the K discrepancy.
 
 **Next probe:** Add a second test-only schedule that assigns complete heads per group but computes each head with the independently validated `q4_local_block` path. Compare all stages at 12/8/8 before considering any runtime change.
+
+**Implementation:** Added `--qkv-single-owner-block` alongside the earlier `q4_local` variant. This changes only the captured diagnostic shader, not `kv_teams.py` or the M1 profile. Python compilation and CLI validation are pending before its first M1 run.

@@ -188,9 +188,17 @@ def validate_sustained_native(engine, model, steps, repeats):
     return results
 
 
-def replace_shared_qkv_with_single_owner(source, workers, *, logbase, eps):
+def replace_shared_qkv_with_single_owner(
+    source, workers, *, logbase, eps, use_block=False
+):
     start = source.index("uint kv_team=group/")
     end = source.index("bool rounded=", start)
+    projection = (
+        "for(uint block=simdgroup_index_in_threadgroup;block<32;block+=8)"
+        "q4_local_block<2048>(m,n,out,lane,block*4);"
+        if use_block
+        else "q4_local<2048>(m,n,out,lane,simdgroup_index_in_threadgroup,8);"
+    )
     replacement = f"""for(uint work=group;work<40;work+={workers}) {{
             uint head=work;
             uint local=head<32?head:head<36?head-32:head-36;
@@ -200,7 +208,7 @@ def replace_shared_qkv_with_single_owner(source, workers, *, logbase, eps):
             m.b+=local*128*32;
             m.n=128;
             device bfloat16_t* out=(head<32?q:head<36?k:v)+local*128;
-            q4_local<2048>(m,n,out,lane,simdgroup_index_in_threadgroup,8);
+            {projection}
             threadgroup_barrier(mem_flags::mem_device);
             if(simdgroup_index_in_threadgroup==0 && head<36)
                 head_norm(out,(const device bfloat16_t*)(bank+d[head<32?5:6]),1,!global,uint(position),{logbase}f,{eps}f,lane,0);
@@ -216,13 +224,24 @@ def replace_shared_qkv_with_single_owner(source, workers, *, logbase, eps):
 
 
 def instrument_stage_kernel(
-    specification, metal, *, workers, logbase, eps, single_owner_qkv=False
+    specification,
+    metal,
+    *,
+    workers,
+    logbase,
+    eps,
+    single_owner_qkv=False,
+    single_owner_block=False,
 ):
     options = dict(specification)
     source = options["source"]
-    if single_owner_qkv:
+    if single_owner_qkv or single_owner_block:
         source = replace_shared_qkv_with_single_owner(
-            source, workers, logbase=logbase, eps=eps
+            source,
+            workers,
+            logbase=logbase,
+            eps=eps,
+            use_block=single_owner_block,
         )
     width = 6144
 
@@ -480,15 +499,22 @@ def main():
     parser.add_argument(
         "--qkv-single-owner",
         action="store_true",
-        help="In stage diagnostics, assign complete Q/K/V heads to resident groups",
+        help="In stage diagnostics, assign complete Q/K/V heads using q4_local",
+    )
+    parser.add_argument(
+        "--qkv-single-owner-block",
+        action="store_true",
+        help="In stage diagnostics, assign complete Q/K/V heads using q4_local_block",
     )
     args = parser.parse_args()
     if args.sustained_steps < 0 or args.repeats < 1:
         parser.error("--sustained-steps must be nonnegative and --repeats must be positive")
     if args.stage_diagnostics and (args.workers is None or args.sustained_steps):
         parser.error("--stage-diagnostics requires --workers and cannot be combined with --sustained-steps")
-    if args.qkv_single_owner and not args.stage_diagnostics:
-        parser.error("--qkv-single-owner requires --stage-diagnostics")
+    if (args.qkv_single_owner or args.qkv_single_owner_block) and not args.stage_diagnostics:
+        parser.error("single-owner QKV modes require --stage-diagnostics")
+    if args.qkv_single_owner and args.qkv_single_owner_block:
+        parser.error("choose only one single-owner QKV mode")
     if args.workers is not None:
         from dataclasses import replace
 
@@ -520,6 +546,7 @@ def main():
             logbase=math.log2(model.config["rope_theta"]),
             eps=model.config["rms_norm_eps"],
             single_owner_qkv=args.qkv_single_owner,
+            single_owner_block=args.qkv_single_owner_block,
         )
         projection_kernel = make_single_head_projection_kernel(specification, metal)
         captured_stages = {}
