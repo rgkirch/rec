@@ -166,3 +166,9 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** The 12-worker production-path failure is still established by the post-QKV Q/K stages and downstream mismatch, but the raw projection capture is not yet validated at 12. Do not use it to distinguish raw projection from normalization. The capture tool's indexing or visibility under cross-group writes may be faulty; that is not yet understood.
 
 **Next probe:** Add per-head and sample-level details to the raw-V-versus-final-V invariant to determine whether the capture is displaced, partially written, or otherwise inconsistent before using raw-stage results.
+
+### 2026-10-27 — Raw-V capture points to missing diagnostic writes
+
+**Results:** With the same 12/8/8 instrumented kernel, raw V differed from the later V buffer in 96 entries: 32 in KV head 2 and 64 in head 3. The first missing capture values were zeros while the later V buffer held nonzero values. The later V buffer still matched native exactly. The 8/8/8 raw-V invariant remained exact.
+
+**Interpretation:** The per-head raw capture itself fails to write some values in the 12-worker case; it cannot be treated as evidence that Rec's V projection is wrong. The stage data makes a concurrency/indexing flaw in the diagnostic visible. Replace concurrent per-head stores with a single-group snapshot bracketed by global barriers, then recheck the raw-V invariant before interpreting Q/K.
