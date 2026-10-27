@@ -188,3 +188,9 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Next probe:** Build an independent one-threadgroup-per-head Q/K/V projection check using the packed layer-0 weights and native input normalization. This bypasses the 12-worker shared projection queue and head partitioning, and can determine whether the packed matrix math/head normalization are sound outside that path.
 
 **Implementation:** Added a test-only kernel that assigns one threadgroup to each of the 40 Q/K/V heads, uses `q4_local_block` plus the corresponding Q/K normalization, and compares the packed-weight result to native MLX. Python compilation passes; the Metal kernel has not yet been compiled or run.
+
+### 2026-10-27 — Independent-projection harness input correction
+
+**Observation:** The first run stopped before the independent Metal kernel was invoked with `ValueError: Invalid type list received in array initialization`. The helper passed `engine.metadata`, which is the Python metadata list, rather than the per-session MLX `uint32` metadata array.
+
+**Correction:** Pass `native_session._state["metadata"]` to the kernel. No independent-projection result was produced by the failed attempt.

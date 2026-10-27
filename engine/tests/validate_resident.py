@@ -404,7 +404,7 @@ def validate_layer0_stages(engine, model, captured_stages, projection_kernel):
     down = layer.mlp.down_proj(activation)
     output = attention_residual + down
     independent = projection_kernel(
-        inputs=[engine.banks[0], engine.metadata, input_norm.reshape(-1)],
+        inputs=[engine.banks[0], native_session._state["metadata"], input_norm.reshape(-1)],
         grid=(40 * 256, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(40, 128)],
