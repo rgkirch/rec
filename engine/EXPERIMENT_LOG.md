@@ -39,4 +39,12 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Planned falsification:** Use the project-owned validation harness to compare native and Rec layer traces, logits, and KV state at 12 resident workers; repeat for determinism, then run sustained sequential decode. Measure throughput only after correctness and reliability pass. Keep the default M1 profile at `8/8/8` unless the evidence supports a separate profile change.
 
-**Open prerequisite:** The model and Python environment previously used for these experiments were located under `/tmp`. The user has directed that `/tmp` no longer be used. Before running the 12-worker validation, locate existing persistent model/environment assets; do not move, copy, or create large assets without direction.
+### 2026-10-27 — Persistent checkpoint setup
+
+**Question:** Can the existing model mirror supply the checkpoint without using `/tmp` or creating a separate artifact directory?
+
+**Steps:** Searched persistent home locations for the Flint INT4 weights. The existing `RecursiveSI/flint-int4` model mirror contained Git LFS pointer files; each weight pointer was only 135 bytes, and its local LFS object store was 132 KB. The five shard pointers specify about 22.6 GB of weights. The volume had 102 GB free. Initialized Git LFS locally in the existing model mirror and ran `git lfs pull` there.
+
+**Results:** The five safetensors shards and tokenizer were materialized in `/Users/me/mirror/huggingface.co/RecursiveSI/flint-int4`; the model directory is about 22 GB and the model repository worktree remains clean. No checkpoint was copied to or read from `/tmp`, and nothing was pushed.
+
+**Interpretation:** The persistent checkpoint prerequisite is resolved. The project’s `engine/.gitignore` already ignores `engine/.venv/`, so a project-local Python environment can be used without adding environment files to Git. Environment setup and 12-worker validation remain to be done.
