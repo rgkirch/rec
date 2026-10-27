@@ -90,3 +90,9 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Steps:** Added a diagnostic mode to the existing project validator. It builds an instrumented copy of the captured decode shader, captures layer-0 input normalization, attention output/residual, post-attention normalization, dense gate/up/activation/down, and final layer output, then compares those arrays with native MLX intermediates. The instrumentation is test-only and does not alter the checked-in runtime kernel or default profile.
 
 **Checks:** Python compilation, CLI help, the M1 profile routing test, the BF16 expert-reduction test, and `git diff --check` passed. The instrumented shader has not yet been compiled or run.
+
+### 2026-10-27 — Stage-probe harness correction
+
+**Observation:** The first `--stage-diagnostics` invocation stopped before compiling the instrumented kernel with `KeyError: 'output_shapes'`. In this kernel API, output names are part of the kernel specification, while output shapes and dtypes are supplied at each invocation.
+
+**Correction:** Keep the additional output name in the instrumented kernel specification and append its shape/dtype in the invocation wrapper. No inference output was produced by the failed attempt.

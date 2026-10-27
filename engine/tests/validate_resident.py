@@ -263,8 +263,6 @@ def instrument_stage_kernel(specification, metal):
 
     options["source"] = source
     options["output_names"] = [*options["output_names"], "stage_trace"]
-    options["output_shapes"] = [*options["output_shapes"], (9, width)]
-    options["output_dtypes"] = [*options["output_dtypes"], mx.bfloat16]
     return metal(name="flint_decode_stage_probe", **options)
 
 
@@ -376,6 +374,9 @@ def main():
         captured_stages = {}
 
         def capture_stages(*call_args, **call_kwargs):
+            call_kwargs = dict(call_kwargs)
+            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (9, 6144)]
+            call_kwargs["output_dtypes"] = [*call_kwargs["output_dtypes"], mx.bfloat16]
             outputs = stage_kernel(*call_args, **call_kwargs)
             captured_stages["values"] = outputs[-1]
             return outputs[:-1]
