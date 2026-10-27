@@ -189,17 +189,49 @@ def validate_sustained_native(engine, model, steps, repeats):
 
 
 def replace_shared_qkv_with_single_owner(
-    source, workers, *, logbase, eps, use_block=False, two_phase=False
+    source, workers, *, logbase, eps, use_block=False, two_phase=False, round_qkv=False
 ):
     start = source.index("uint kv_team=group/")
     end = source.index("bool rounded=", start)
     projection = (
         "for(uint block=simdgroup_index_in_threadgroup;block<32;block+=8)"
         "q4_local_block<2048>(m,n,out,lane,block*4);"
-        if use_block or two_phase
+        if use_block or two_phase or round_qkv
         else "q4_local<2048>(m,n,out,lane,simdgroup_index_in_threadgroup,8);"
     )
-    if two_phase:
+    if round_qkv:
+        round_count = (40 + workers - 1) // workers
+        replacement = f"""for(uint round=0;round<{round_count};++round) {{
+            uint head=group+round*{workers};
+            if(head<40) {{
+                uint local=head<32?head:head<36?head-32:head-36;
+                Matrix m=weight_matrix(bank,d+(head<32?10:head<36?15:20));
+                m.w+=size_t(local)*128*1024;
+                m.s+=local*128*32;
+                m.b+=local*128*32;
+                m.n=128;
+                device bfloat16_t* out=(head<32?q:head<36?k:v)+local*128;
+                {projection}
+                threadgroup_barrier(mem_flags::mem_device);
+            }}
+            SYNC();
+        }}
+        __QKV_RAW_CAPTURE__
+        for(uint work=group;work<40;work+={workers}) {{
+            uint head=work;
+            uint local=head<32?head:head<36?head-32:head-36;
+            device bfloat16_t* out=(head<32?q:head<36?k:v)+local*128;
+            if(simdgroup_index_in_threadgroup==0 && head<36)
+                head_norm(out,(const device bfloat16_t*)(bank+d[head<32?5:6]),1,!global,uint(position),{logbase}f,{eps}f,lane,0);
+            threadgroup_barrier(mem_flags::mem_device);
+            if(head>=32) {{
+                KVView target=head<36?keys:vals;
+                for(uint dim=tid;dim<128;dim+=256)target.store(local,insert,dim,out[dim]);
+            }}
+        }}
+        SYNC();
+        """
+    elif two_phase:
         replacement = f"""for(uint work=group;work<40;work+={workers}) {{
             uint head=work;
             uint local=head<32?head:head<36?head-32:head-36;
@@ -263,10 +295,11 @@ def instrument_stage_kernel(
     single_owner_qkv=False,
     single_owner_block=False,
     two_phase_qkv=False,
+    round_qkv=False,
 ):
     options = dict(specification)
     source = options["source"]
-    if single_owner_qkv or single_owner_block or two_phase_qkv:
+    if single_owner_qkv or single_owner_block or two_phase_qkv or round_qkv:
         source = replace_shared_qkv_with_single_owner(
             source,
             workers,
@@ -274,6 +307,7 @@ def instrument_stage_kernel(
             eps=eps,
             use_block=single_owner_block,
             two_phase=two_phase_qkv,
+            round_qkv=round_qkv,
         )
     width = 6144
 
@@ -305,7 +339,7 @@ def instrument_stage_kernel(
         raise ValueError(f"Expected one layer input-normalization anchor, found {source.count(rms_anchor)}")
     source = source.replace(rms_anchor, worker_input_capture + rms_anchor, 1)
 
-    if two_phase_qkv:
+    if two_phase_qkv or round_qkv:
         marker = "__QKV_RAW_CAPTURE__"
         if source.count(marker) != 1:
             raise ValueError("Expected one two-phase raw-QKV capture point")
@@ -669,12 +703,22 @@ def main():
         action="store_true",
         help="In stage diagnostics, barrier after all Q/K/V projections before normalization",
     )
+    parser.add_argument(
+        "--qkv-rounds",
+        action="store_true",
+        help="In stage diagnostics, assign one Q/K/V head per group per globally synchronized round",
+    )
     args = parser.parse_args()
     if args.sustained_steps < 0 or args.repeats < 1:
         parser.error("--sustained-steps must be nonnegative and --repeats must be positive")
     if args.stage_diagnostics and (args.workers is None or args.sustained_steps):
         parser.error("--stage-diagnostics requires --workers and cannot be combined with --sustained-steps")
-    qkv_modes = (args.qkv_single_owner, args.qkv_single_owner_block, args.qkv_two_phase)
+    qkv_modes = (
+        args.qkv_single_owner,
+        args.qkv_single_owner_block,
+        args.qkv_two_phase,
+        args.qkv_rounds,
+    )
     if any(qkv_modes) and not args.stage_diagnostics:
         parser.error("diagnostic QKV modes require --stage-diagnostics")
     if sum(qkv_modes) > 1:
@@ -712,6 +756,7 @@ def main():
             single_owner_qkv=args.qkv_single_owner,
             single_owner_block=args.qkv_single_owner_block,
             two_phase_qkv=args.qkv_two_phase,
+            round_qkv=args.qkv_rounds,
         )
         projection_kernel = make_single_head_projection_kernel(specification, metal)
         captured_stages = {}
@@ -737,7 +782,7 @@ def main():
             model,
             captured_stages,
             projection_kernel,
-            capture_raw_qkv=args.qkv_two_phase,
+            capture_raw_qkv=args.qkv_two_phase or args.qkv_rounds,
         )
         return
     if args.sustained_steps:

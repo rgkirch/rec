@@ -290,3 +290,5 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** The shared per-group projection input is not the cause. The mismatch occurs while assigning/executing Q/K projection work in the grouped schedule, before normalization; it is not yet clear whether work iteration/order or a kernel indexing/coordination detail is responsible.
 
 **Next probe:** Assign exactly one head to each group per round, with a global barrier between rounds, and compare raw and normalized Q/K/V. This tests whether reusing a threadgroup across multiple head iterations causes the mismatch.
+
+**Implementation:** Added the test-only `--qkv-rounds` mode. It uses the independent `q4_local_block` work for one head per group, globally synchronizes each round, then snapshots raw Q/K/V and normalizes/publishes them. No runtime source changed. Python/static checks are pending before the next M1 run.
