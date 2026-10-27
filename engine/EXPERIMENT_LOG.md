@@ -206,3 +206,9 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Next probe:** Run a test-only alternate QKV schedule in which each resident group owns complete heads using `q4_local`, followed by a global barrier. This will test whether avoiding the shared ticket queue restores 12/8/8 parity without changing production code.
 
 **Implementation:** Added `--qkv-single-owner` to the stage diagnostic. It replaces only the test kernel's shared QKV queue with per-group full-head work and a global barrier; the checked-in runtime source/profile remain unchanged. Static Python compilation and CLI checks pass; Metal validation is pending.
+
+### 2026-10-27 — Single-owner probe source-rendering correction
+
+**Observation:** The first `--qkv-single-owner` run failed Metal compilation before inference. The test replacement inserted `__LOGBASE__` and `__EPS__` after the normal source-rendering pass, leaving those placeholders undeclared.
+
+**Correction:** Render those two constants from the loaded model config when constructing the test-only replacement. No parity or stage result was produced by the failed attempt.

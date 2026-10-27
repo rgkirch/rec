@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 import statistics
 import time
 from pathlib import Path
@@ -187,7 +188,7 @@ def validate_sustained_native(engine, model, steps, repeats):
     return results
 
 
-def replace_shared_qkv_with_single_owner(source, workers):
+def replace_shared_qkv_with_single_owner(source, workers, *, logbase, eps):
     start = source.index("uint kv_team=group/")
     end = source.index("bool rounded=", start)
     replacement = f"""for(uint work=group;work<40;work+={workers}) {{
@@ -202,7 +203,7 @@ def replace_shared_qkv_with_single_owner(source, workers):
             q4_local<2048>(m,n,out,lane,simdgroup_index_in_threadgroup,8);
             threadgroup_barrier(mem_flags::mem_device);
             if(simdgroup_index_in_threadgroup==0 && head<36)
-                head_norm(out,(const device bfloat16_t*)(bank+d[head<32?5:6]),1,!global,uint(position),__LOGBASE__,__EPS__,lane,0);
+                head_norm(out,(const device bfloat16_t*)(bank+d[head<32?5:6]),1,!global,uint(position),{logbase}f,{eps}f,lane,0);
             threadgroup_barrier(mem_flags::mem_device);
             if(head>=32) {{
                 KVView target=head<36?keys:vals;
@@ -214,11 +215,15 @@ def replace_shared_qkv_with_single_owner(source, workers):
     return source[:start] + replacement + source[end:]
 
 
-def instrument_stage_kernel(specification, metal, *, workers, single_owner_qkv=False):
+def instrument_stage_kernel(
+    specification, metal, *, workers, logbase, eps, single_owner_qkv=False
+):
     options = dict(specification)
     source = options["source"]
     if single_owner_qkv:
-        source = replace_shared_qkv_with_single_owner(source, workers)
+        source = replace_shared_qkv_with_single_owner(
+            source, workers, logbase=logbase, eps=eps
+        )
     width = 6144
 
     def store_vector(slot, name, size):
@@ -566,6 +571,8 @@ def main():
             specification,
             metal,
             workers=args.workers,
+            logbase=math.log2(model.config["rope_theta"]),
+            eps=model.config["rms_norm_eps"],
             single_owner_qkv=args.qkv_single_owner,
         )
         projection_kernel = make_single_head_projection_kernel(specification, metal)
