@@ -215,7 +215,17 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Interpretation:** Assigning whole heads to resident groups restores Q and V in this diagnostic but does not validate the 12-worker schedule; the K path remains incorrect. This variant adds a global QKV barrier and is test-only. No runtime schedule or default profile has changed.
 
-**Instrumentation cleanup:** Removed the inconsistent raw pre-normalization capture and its extra global barriers from the standard diagnostic. The stage buffer now retains only post-QKV captures and the independent per-head check. Python compilation, CLI help, and `git diff --check` pass. Rerun the standard 12-worker stage diagnostic against the unmodified shared-QKV schedule.
+**Instrumentation cleanup:** Removed the inconsistent raw pre-normalization capture and its extra global barriers from the standard diagnostic. The stage buffer now retains only post-QKV captures and the independent per-head check. Python compilation, CLI help, and `git diff --check` pass.
+
+### 2026-10-27 — Clean standard 12-worker stage diagnostic
+
+**Procedure:** Re-ran the standard diagnostic after cleanup at 12/8/8 and at 8/8/8. The standard mode leaves the shared-QKV code and barrier schedule unchanged; it only copies post-QKV stage arrays after the existing global barrier. The independent per-head kernel ran in both cases.
+
+**Results:** At 8/8/8, the independent Q/K/V check and every captured full-path stage matched native exactly. At 12/8/8, the independent check again matched all 40 heads exactly. In the standard shared-QKV path, input normalization matched, but normalized Q differed in 1,408/4,096 values (heads 18, 21, and 23–31 fully), K differed in 128/512 values (all 128 in KV head 2), and V differed in 20/512 values (KV head 2). The merged attention output differed in 2,046/4,096 values; all later stages diverged.
+
+**Interpretation:** The first incorrect resident stage is the normalized Q output. The independent packed-weight projection and normalization are exact, so the per-head math/weights are valid outside the 12-worker shared schedule. The failure is in that schedule's multi-group Q/K/V task distribution, normalization, or publication; the exact cause is unresolved. The separate single-owner diagnostic at 12 fixes Q/V but still fails K, and is not a validated alternative.
+
+**Decision:** Keep the production M1 profile at 8/8/8. Do not report a 12-worker throughput result or treat the test-only schedule as a candidate until full parity and repeatability pass.
 
 ### 2026-10-27 — Single-owner probe source-rendering correction
 
