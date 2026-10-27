@@ -106,3 +106,11 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** The first error occurs in the attention subsystem, before layer-0 MLP. This test does not yet distinguish Q/K/V or attention merge from the output projection.
 
 **Follow-up probe:** Extended the diagnostic to capture the merged attention vector before O projection and to compute the corresponding native Q/K/V, cache update, and attention output using the model's `Attention` implementation. Static compilation passes; this finer probe is pending.
+
+### 2026-10-27 — 8-worker stage control and 12-worker attention-core mismatch
+
+**Procedure:** Ran the extended stage diagnostic once at 12/8/8 and once at 8/8/8, with one repeated-token decode step in each run.
+
+**Results:** At 8/8/8, all captured layer-0 stages—including the merged attention vector, attention output, and dense MLP intermediates—matched native MLX exactly. At 12/8/8, input normalization matched, but the merged attention vector first diverged (2,046 of 4,096 values; max absolute difference 2.703125). The attention output then differed in 2,047 of 2,048 values (max absolute difference 0.291015625).
+
+**Interpretation:** The 8-worker control validates the stage capture and native attention reference for this path. The 12-worker fault occurs before O projection, in Q/K/V production or attention computation/merge. The precise operation remains unknown.
