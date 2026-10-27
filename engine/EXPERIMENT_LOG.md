@@ -144,3 +144,15 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** Across the two per-head runs, corruption remains concentrated in later Q/K/V heads but individual values/head counts vary. This is evidence of nondeterministic corruption in the shared projection path, not a stable head-index mapping error. It still does not distinguish raw matrix projection from Q/K normalization or KV publication.
 
 **Next probe:** Capture the Q/K/V projection outputs before head normalization, then compare raw and normalized values separately. The test-only shader instrumentation and native raw-projection references are implemented; Python compilation passes, and the M1 run is pending.
+
+### 2026-10-27 — Raw-projection capture consistency failure
+
+**Procedure:** Ran the raw Q/K/V stage probe at 12/8/8.
+
+**Results:** The recorded raw outputs differed from native by 32/4,096 Q values (max 0.4921875), 76/512 K values (0.7890625), and 40/512 V values (1.390625). The later post-QKV outputs differed by 1,408/4,096 Q, 128/512 K, and zero V values. The recorded raw V also differed from the later V buffer capture in 40 entries, although V is not normalized or otherwise transformed between those captures and the later V capture exactly matched native.
+
+**Interpretation:** The raw capture is not trustworthy yet. The Q/K copy runs before `head_norm`, which executes in SIMD group 0, but the diagnostic had no threadgroup barrier between copying across SIMD groups and beginning normalization. This is a diagnostic race. It does not explain the raw-V inconsistency, which remains unresolved.
+
+**Correction:** Added a threadgroup device barrier after the raw Q/K/V copy and a same-run check that raw V equals the later V-buffer capture. Do not interpret raw-stage mismatch counts until this consistency check passes.
+
+**Next probe:** Run the corrected instrumentation at 8/8/8 and 12/8/8; first verify raw-V capture consistency and the 8-worker native control.

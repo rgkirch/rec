@@ -272,6 +272,7 @@ def instrument_stage_kernel(specification, metal):
         "if(head<32)stage_trace[13u*6144u+head*128u+capture_dim]=out[capture_dim];"
         "else if(head<36)stage_trace[14u*6144u+(head-32u)*128u+capture_dim]=out[capture_dim];"
         "else stage_trace[15u*6144u+(head-36u)*128u+capture_dim]=out[capture_dim];}}"
+        "threadgroup_barrier(mem_flags::mem_device);"
     )
     source = source.replace(head_norm, raw_projection_capture + head_norm, 1)
 
@@ -303,6 +304,19 @@ def validate_layer0_stages(engine, model, captured_stages):
     engine.forward(session._state, token)
     stages = captured_stages["values"]
     mx.eval(stages)
+    raw_value = stages[15, :512]
+    final_value = stages[12, :512]
+    capture_unequal = int(mx.sum(raw_value != final_value).item())
+    print(
+        json.dumps(
+            dict(
+                stage_capture_check="raw_value_vs_final_value",
+                exact=capture_unequal == 0,
+                unequal=capture_unequal,
+            )
+        ),
+        flush=True,
+    )
 
     layer = model.native.layers[0]
     hidden = model.native.model.embed_tokens(mx.array([[token]], mx.int32))
