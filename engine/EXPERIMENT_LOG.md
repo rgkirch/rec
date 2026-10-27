@@ -176,3 +176,13 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Correction:** Replaced concurrent per-head stores with a group-0 snapshot of Q/K/V bracketed by global barriers after QKV projection and before normalization. This is instrumentation only and adds barriers to the diagnostic kernel; it does not modify the runtime kernel. The raw-V invariant remains in the report.
 
 **Next probe:** Run the corrected single-group snapshot at 8/8/8 and 12/8/8. Confirm raw V equals its later capture and the full 8-worker stage control remains exact before interpreting 12-worker raw Q/K.
+
+### 2026-10-27 — Single-group raw snapshot still inconsistent at 12 workers
+
+**Procedure:** Replaced per-head raw writes with group-0 copies bracketed by two added global barriers. Ran the instrumented diagnostic at 8/8/8 and 12/8/8.
+
+**Results:** At 8/8/8, the raw-V consistency check and all Q/K/V and downstream native comparisons passed exactly. At 12/8/8, raw V differed from the later V capture in 168 entries (40 in head 2, all 128 in head 3); raw Q/K/V and the final normalized Q/K/V captures differed from native. The final normalized captures had Q=1,408/4,096, K=128/512, and V=4/512 mismatches. The first normalized-stage mismatch was Q.
+
+**Interpretation:** Even a single-group raw snapshot is unreliable in this 12-worker diagnostic, so its raw Q/K/V figures remain unusable. The inserted global barriers also change scheduling. The native mismatch in normalized Q/K remains, but this instrumentation does not identify whether the fault is in Q4 task distribution, head normalization, or KV publication.
+
+**Next probe:** Build an independent one-threadgroup-per-head Q/K/V projection check using the packed layer-0 weights and native input normalization. This bypasses the 12-worker shared projection queue and head partitioning, and can determine whether the packed matrix math/head normalization are sound outside that path.
