@@ -306,13 +306,24 @@ def validate_layer0_stages(engine, model, captured_stages):
     mx.eval(stages)
     raw_value = stages[15, :512]
     final_value = stages[12, :512]
-    capture_unequal = int(mx.sum(raw_value != final_value).item())
+    capture_difference = raw_value != final_value
+    capture_unequal = int(mx.sum(capture_difference).item())
+    raw_values, final_values = raw_value.tolist(), final_value.tolist()
+    mismatch_indices = [
+        index for index, (raw, final) in enumerate(zip(raw_values, final_values, strict=True))
+        if raw != final
+    ]
     print(
         json.dumps(
             dict(
                 stage_capture_check="raw_value_vs_final_value",
                 exact=capture_unequal == 0,
                 unequal=capture_unequal,
+                unequal_by_head=mx.sum(capture_difference.reshape(-1, 128), axis=1).tolist(),
+                first_mismatches=[
+                    dict(index=index, raw=raw_values[index], final=final_values[index])
+                    for index in mismatch_indices[:8]
+                ],
             )
         ),
         flush=True,

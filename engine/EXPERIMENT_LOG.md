@@ -156,3 +156,13 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Correction:** Added a threadgroup device barrier after the raw Q/K/V copy and a same-run check that raw V equals the later V-buffer capture. Do not interpret raw-stage mismatch counts until this consistency check passes.
 
 **Next probe:** Run the corrected instrumentation at 8/8/8 and 12/8/8; first verify raw-V capture consistency and the 8-worker native control.
+
+### 2026-10-27 — Corrected raw-capture controls and unresolved 12-worker inconsistency
+
+**Procedure:** Added the pre-normalization threadgroup barrier, then ran stage diagnostics at 8/8/8 and 12/8/8.
+
+**Results:** At 8/8/8, raw V equaled the later V-buffer capture, and all raw/normalized Q/K/V and downstream stages matched native exactly. At 12/8/8, the same-run raw-V check still failed (44 unequal entries), even though the later V-buffer stage exactly matched native. Raw Q/K/V capture values also differed; the previous missing-barrier issue is fixed, but the 12-worker raw-V contradiction remains.
+
+**Interpretation:** The 12-worker production-path failure is still established by the post-QKV Q/K stages and downstream mismatch, but the raw projection capture is not yet validated at 12. Do not use it to distinguish raw projection from normalization. The capture tool's indexing or visibility under cross-group writes may be faulty; that is not yet understood.
+
+**Next probe:** Add per-head and sample-level details to the raw-V-versus-final-V invariant to determine whether the capture is displaced, partially written, or otherwise inconsistent before using raw-stage results.
