@@ -279,4 +279,14 @@ Historical probe commands, exact timestamps, and source revisions for these high
 
 **Implementation:** Added a test-only capture of layer-0 hidden input and normalized `n` for each resident group. It is independent of the QKV schedule variant and leaves runtime code unchanged.
 
-**Tooling failure:** The first M1 run failed Metal compilation: adding a second kernel output exceeded MLX's Metal buffer binding limit (`buffer(31)`, valid range ends at 30). No inference result was produced. Pack the per-worker slices into the existing stage-trace output instead, preserving a single added binding, then rerun the 8-worker control.
+**Tooling failure:** The first M1 run failed Metal compilation: adding a second kernel output exceeded MLX's Metal buffer binding limit (`buffer(31)`, valid range ends at 30). No inference result was produced. Packed per-worker slices into the existing stage-trace output, preserving a single added binding.
+
+### 2026-10-27 — Per-worker input consistency
+
+**Procedure:** Re-ran the two-phase raw-QKV diagnostic at 8/8/8 and 12/8/8 with per-group layer-0 hidden and normalized-input captures.
+
+**Results:** Every worker group matched native hidden input and normalized `n` exactly at both worker counts. At 12/8/8, the independent raw/normalized per-head QKV remained exact, while the grouped raw projection mismatch remained: Q heads 22 and 23 had 32/128 differences each, all four K heads differed in all 128 values, and V was exact. At 8/8/8, all captures and model stages matched exactly.
+
+**Interpretation:** The shared per-group projection input is not the cause. The mismatch occurs while assigning/executing Q/K projection work in the grouped schedule, before normalization; it is not yet clear whether work iteration/order or a kernel indexing/coordination detail is responsible.
+
+**Next probe:** Assign exactly one head to each group per round, with a global barrier between rounds, and compare raw and normalized Q/K/V. This tests whether reusing a threadgroup across multiple head iterations causes the mismatch.
