@@ -262,3 +262,5 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** A global barrier before normalization/publication does not fix 12 workers; it changes which outputs diverge. That makes guessing from post-normalization captures insufficient. The two-phase variant now provides a clean point to compare raw projections before normalization.
 
 **Next probe:** After the projection global barrier, snapshot raw Q/K/V from group 0, synchronize again, then proceed with normalization. Compare those raw vectors directly to native projections; this separates projection work from head normalization/publication.
+
+**Implementation:** Extended only the `--qkv-two-phase` test shader with a group-0 raw Q/K/V snapshot between global barriers and raw-stage comparisons against native projections. The buffer now allocates slots 13–15 for those raw vectors. Static checks and 8-worker capture control are pending.

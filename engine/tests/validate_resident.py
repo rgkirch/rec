@@ -213,6 +213,7 @@ def replace_shared_qkv_with_single_owner(
             threadgroup_barrier(mem_flags::mem_device);
         }}
         SYNC();
+        __QKV_RAW_CAPTURE__
         for(uint work=group;work<40;work+={workers}) {{
             uint head=work;
             uint local=head<32?head:head<36?head-32:head-36;
@@ -288,6 +289,18 @@ def instrument_stage_kernel(
             "uint capture_i=(tid+(capture_j/4)*256)*4+capture_j%4;"
             f"stage_trace[{slot}u*{width}u+capture_i]=h[capture_j];}}}}"
         )
+
+    if two_phase_qkv:
+        marker = "__QKV_RAW_CAPTURE__"
+        if source.count(marker) != 1:
+            raise ValueError("Expected one two-phase raw-QKV capture point")
+        raw_capture = (
+            store_vector(13, "q", 4096)
+            + store_vector(14, "k", 512)
+            + store_vector(15, "v", 512)
+            + "SYNC();\n        "
+        )
+        source = source.replace(marker, raw_capture, 1)
 
     def insert_after_call(text, prefix, addition):
         if text.count(prefix) != 1:
@@ -394,7 +407,9 @@ def make_single_head_projection_kernel(specification, metal):
     return metal(name="flint_independent_head_projection", **options)
 
 
-def validate_layer0_stages(engine, model, captured_stages, projection_kernel):
+def validate_layer0_stages(
+    engine, model, captured_stages, projection_kernel, *, capture_raw_qkv=False
+):
     prompt, token = [1], 150006
     session = engine.make_session(max_new_tokens=2)
     native_session = engine.make_session(max_new_tokens=2)
@@ -470,6 +485,25 @@ def validate_layer0_stages(engine, model, captured_stages, projection_kernel):
         ),
         flush=True,
     )
+    if capture_raw_qkv:
+        raw_references = (
+            ("raw_query", 13, raw_query),
+            ("raw_key", 14, raw_keys),
+            ("raw_value", 15, raw_values),
+        )
+        for name, slot, reference in raw_references:
+            expected = reference.reshape(-1)
+            actual = stages[slot, : expected.size].reshape(expected.shape)
+            unequal = int(mx.sum(actual != expected).item())
+            max_abs = float(
+                mx.max(mx.abs(actual.astype(mx.float32) - expected.astype(mx.float32))).item()
+            )
+            print(
+                json.dumps(
+                    dict(stage=name, exact=unequal == 0, unequal=unequal, max_abs=max_abs)
+                ),
+                flush=True,
+            )
     references = [("input_norm", 0, input_norm)]
     references.extend(
         (
@@ -591,14 +625,20 @@ def main():
 
         def capture_stages(*call_args, **call_kwargs):
             call_kwargs = dict(call_kwargs)
-            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (13, 6144)]
+            call_kwargs["output_shapes"] = [*call_kwargs["output_shapes"], (16, 6144)]
             call_kwargs["output_dtypes"] = [*call_kwargs["output_dtypes"], mx.bfloat16]
             outputs = stage_kernel(*call_args, **call_kwargs)
             captured_stages["values"] = outputs[-1]
             return outputs[:-1]
 
         engine.kernel = capture_stages
-        validate_layer0_stages(engine, model, captured_stages, projection_kernel)
+        validate_layer0_stages(
+            engine,
+            model,
+            captured_stages,
+            projection_kernel,
+            capture_raw_qkv=args.qkv_two_phase,
+        )
         return
     if args.sustained_steps:
         validate_sustained_native(
