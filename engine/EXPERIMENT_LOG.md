@@ -96,3 +96,11 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Observation:** The first `--stage-diagnostics` invocation stopped before compiling the instrumented kernel with `KeyError: 'output_shapes'`. In this kernel API, output names are part of the kernel specification, while output shapes and dtypes are supplied at each invocation.
 
 **Correction:** Keep the additional output name in the instrumented kernel specification and append its shape/dtype in the invocation wrapper. No inference output was produced by the failed attempt.
+
+### 2026-10-27 — 12-worker first-stage localization
+
+**Procedure:** Ran the layer-0 stage diagnostic at resident `workers=12`, `mlp_workers=8`, `head_workers=8`, comparing one repeated-token decode step with native MLX.
+
+**Results:** The input normalization matched exactly. The first mismatch was the attention output projection result: 2,043 of 2,048 values differed, with max absolute difference 0.291015625. Attention residual, post-attention normalization, dense gate/up/activation/down, and final layer output also differed, as expected downstream of that point.
+
+**Interpretation:** The first error occurs in the attention subsystem, before layer-0 MLP. This test does not yet distinguish Q/K/V or attention merge from the output projection.
