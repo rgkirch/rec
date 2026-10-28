@@ -59,7 +59,9 @@ ARGMAX = r"""
 """
 
 
-def transform(source, workers=40):
+def transform(
+    source, workers=40, *, coherent_statistics=False, capture_group_tokens=False
+):
     begin = source.index("    for(uint j=0;j<8;++j) {", source.index("Matrix embedding="))
     finish = source.index("    if(tid==0)diagnostic[group]=0;", begin)
     prefix, core, suffix = source[:begin], source[begin:finish], source[finish:]
@@ -84,5 +86,74 @@ def transform(source, workers=40):
         device bfloat16_t* trace=block_trace+block_step*(50u*2048u);
         if(index==0)profile[block_step*2]=block_input_token;
 """
-    argmax = ARGMAX.replace("10240u", f"{workers * 256}u").replace("peer<40", f"peer<{workers}")
+    argmax = ARGMAX
+    if coherent_statistics:
+        for old, new in (
+            (
+                "statistics[group*2]=maximum;",
+                "((device coherent(device) float*)statistics)[group*2]=maximum;",
+            ),
+            (
+                "((device uint*)statistics)[group*2+1]=choice;",
+                "((device coherent(device) uint*)statistics)[group*2+1]=choice;",
+            ),
+            (
+                "float other=statistics[peer*2];",
+                "float other=((device coherent(device) float*)statistics)[peer*2];",
+            ),
+            (
+                "uint other_word=((device uint*)statistics)[peer*2+1];",
+                "uint other_word=((device coherent(device) uint*)statistics)[peer*2+1];",
+            ),
+        ):
+            argmax = once(argmax, old, new)
+        argmax = once(
+            argmax,
+            """        if(simdgroup_index_in_threadgroup==0) {
+            float value=-as_type<float>(0x7f800000u);
+            uint word=0xffffffffu;
+            for(uint peer=lane;peer<40;peer+=32) {
+                float other=((device coherent(device) float*)statistics)[peer*2];
+                uint other_word=((device coherent(device) uint*)statistics)[peer*2+1];
+                if(other>value || (other==value && other_word<word)) {
+                    value=other;word=other_word;
+                }
+            }
+            float maximum=simd_max(value);
+            uint choice=simd_min(value==maximum?word:0xffffffffu);
+            if(lane==0)layer_descriptor[0]=choice;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        block_input_token=layer_descriptor[0];""",
+            """        // sync_all uses control[0:3]; control[3] broadcasts the selected token.
+        if(group==0 && simdgroup_index_in_threadgroup==0) {
+            float value=-as_type<float>(0x7f800000u);
+            uint word=0xffffffffu;
+            for(uint peer=lane;peer<40;peer+=32) {
+                float other=((device coherent(device) float*)statistics)[peer*2];
+                uint other_word=((device coherent(device) uint*)statistics)[peer*2+1];
+                if(other>value || (other==value && other_word<word)) {
+                    value=other;word=other_word;
+                }
+            }
+            float maximum=simd_max(value);
+            uint choice=simd_min(value==maximum?word:0xffffffffu);
+            if(lane==0)atomic_store_explicit(control+3,choice,memory_order_relaxed);
+        }
+        SYNC();
+        // Use the same atomic RMW polling pattern as the global barrier.
+        if(tid==0)layer_descriptor[0]=atomic_fetch_add_explicit(control+3,0u,memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        block_input_token=layer_descriptor[0];""",
+        )
+    if capture_group_tokens:
+        argmax = once(
+            argmax,
+            "        if(index==0)profile[block_step*2+1]=block_input_token;",
+            f"        if(tid==0)profile[17u+block_step*{workers}u+group]=block_input_token;\n"
+            "        if(index==0)profile[block_step*2+1]=block_input_token;",
+        )
+    argmax = argmax.replace("10240u", f"{workers * 256}u").replace(
+        "peer<40", f"peer<{workers}"
+    )
     return prefix + loop + core + argmax + "\n    }\n    if(tid==0)diagnostic[group]=0;\n"

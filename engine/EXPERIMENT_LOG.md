@@ -300,3 +300,67 @@ Historical probe commands, exact timestamps, and source revisions for these high
 **Interpretation:** The mismatch is not caused merely by looping over multiple heads in one threadgroup: one head per group per globally synchronized round still fails. The independent per-head kernel remains exact. Need directly verify payload publication in the 12-group global and three-group KV barriers before narrowing the arithmetic schedule further.
 
 **Next probe:** Add a small deterministic barrier stress test for `sync_all` at 12 groups and `kv_team_sync` with four teams of three groups; each group will publish a phase-tagged payload, synchronize, verify peer payloads, and repeat.
+
+### 2026-10-27 — Cross-group payload visibility and coherent scratch
+
+**Procedure:** Extended the M1 barrier stress kernel to use the current atomic-RMW polling barrier and 256 publication/verification iterations. Tested 8 and 12 resident groups, both the generation and optimized global barriers, and KV-team barriers, with payloads accessed through ordinary `device` pointers or `device coherent(device)` pointers. For each path, repeated each selected case three times. Then integrated the validated coherent-pointer transformation into the optimized M1 kernel only for experimental worker counts 12 through 36 (default 8 remains unchanged), and ran the normal native-vs-Rec sustained validator at 8, 12, 16, and 32 workers.
+
+**Barrier results:** At 12 groups, ordinary-pointer global tests consistently missed peer payloads: each of groups 0–7 reported 1,024 mismatches and groups 8–11 reported 2,048; the first-iteration masks were `[3840] * 8 + [255] * 4`. The ordinary-pointer KV-team test reported mismatches in groups 6–8 (255, 255, and 510 respectively). With coherent pointers for both the writer and reader, all global (generation and optimized) and KV-team probes reported zero mismatches. The 8-group controls also reported zero mismatches with ordinary pointers. One-sided coherent-pointer trials varied by barrier type; production therefore qualifies the shared buffers on both producer and consumer paths rather than relying on a single-sided qualification.
+
+**Implementation:** Added `engine/src/rec_mlx/kernels/coherent_scratch.py`. Its transform qualifies the cross-group Q/K/V, attention partial/merge, KV, router result, and expert intermediates as coherent, and adds coherent Q4/load helpers for device-resident input/output buffers. `build_decoder` applies it after the existing QAT transform only on M1 Max for worker counts 12, 16, 20, 24, 28, 32, and 36; the checked-in 8/8/8 profile is unchanged. The barrier algorithm itself was not changed in this experiment. Updated the stress test so it checks the expected ordinary-pointer failure and coherent-pointer success at 12 workers, while requiring the 8-worker control to pass.
+
+**End-to-end results:** `tests/validate_resident.py` compared full layer traces and logits against native MLX using a one-token prompt and repeated token 150006. At 8/8/8, a 2-step control passed. At 12/8/8, 2 steps passed, then 3 repeats of 16 steps and 2 repeats of 64 steps passed. At 16/8/8, 2 steps and 3 repeats of 16 steps passed. At 32/8/8, 2 steps, 3 repeats of 16 steps, and 2 repeats of 64 steps passed. All checked steps matched exactly; these are correctness/repeatability checks, not throughput measurements.
+
+**Interpretation:** The prior 12-worker divergence is repaired for the tested M1 worker configurations by coherent qualification of shared device scratch. The matching payload stress results and full-model traces implicate cross-threadgroup memory visibility for ordinary scratch pointers, not an inherent Q4 arithmetic limitation or proof that the barrier protocol is unusable. The precise Metal/compiler mechanism is still not independently proven. The 12-worker configuration is now a working, repeatedly validated candidate; 16 and 32 also pass the same sustained parity checks.
+
+**Unresolved:** No throughput or GPU-saturation measurements have been taken for the coherent 12/16/32-worker kernels. Worker counts 20–36, 40+, full-context prefill, long-context KV-block boundaries, and peak memory remain untested. Keep the checked-in profile at 8 until separate performance and broader-context validation are complete.
+
+### 2026-10-27 — 16K prefill parity and worker-scaling benchmark
+
+**Context procedure/results:** Added `--prompt-tokens` to the sustained native validator so it can compare prefill KV/logits and decode traces at a chosen prompt length. Ran a repeated-token 16,384-token prompt with 2 decode steps at 8/8/8, 12/8/8, 16/8/8, and 32/8/8. Each run passed exact native MLX parity for the prompt and both decode steps. This extends the tested context from 8,192 to 16,384; it does not test the 65,536-token KV allocation boundary or the full 256K context.
+
+**Benchmark procedure:** Added `engine/tests/benchmark_resident.py`. For each worker count, it uses an 8,192-token deterministic varied-ID prompt, performs 4 warmup decode steps, then times 128 fixed-token resident decode steps for 3 fresh sessions. It reports prefill and decode separately. Decode is raw resident-kernel throughput with a fixed input token and excludes token sampling and frontend overhead. The initial warmup run is discarded. This is an experimental comparison, not a controlled power/occupancy measurement or a direct comparison with llama-bench.
+
+**Results (median of 3 runs):**
+
+| Resident workers | Prefill tok/s at 8K | Decode tok/s at 8K |
+| ---: | ---: | ---: |
+| 8 | 516.19 | 23.08 |
+| 12 | 519.94 | 26.17 |
+| 16 | 527.20 | 29.95 |
+| 32 | 527.82 | 36.29 |
+
+All profiles kept `mlp_workers=8` and `head_workers=8`. Decode increased by 13.4% at 12 workers, 29.8% at 16, and 57.2% at 32 relative to 8 in this run. Prefill is the same native MLX path across these worker profiles; its small measured spread is run variation, not a worker-count effect.
+
+**Test-suite note:** The full `unittest` suite passed: 53 tests, 1 skipped. Its M4/M5-specific routing test was mistakenly enabled on M1 because its device predicate accepted every recognized profile; the first run produced failures on this unsupported test platform. Narrowed the test predicate to M4 Pro/M5 Pro/M5 Max, matching its declared requirement. M1-specific barrier and kernel-routing tests pass separately. M4/M5 behavior was not tested on this M1 machine.
+
+**Interpretation:** Decode scaling continues through 32 workers, so these measurements do not show a throughput plateau at the tested counts. This alone does not prove the GPU is unsaturated; a direct utilization/occupancy capture remains needed. The worker-count comparison is valid for the tested repeated-input kernel workload because correctness and repeatability passed first, but real prompt distributions, sampled generation, and longer contexts may change the rates.
+
+**Next steps:** Continue with 32K and then longer context parity checks while staying below the prohibited 261,120-token prompt; measure throughput at longer validated contexts; retry a direct GPU utilization/occupancy measurement now that the 12/16/32 paths are stable. Do not change the default 8-worker profile based only on this decode microbenchmark.
+
+### 2026-10-28 — Sampled-generation parity and M1 worker profile
+
+**Issue found:** The 32-worker scalar decode path passed long sustained parity, but its packet sampler initially failed. The sampler adds a vocabulary argmax after the main scratch-coherence transform, so the added `statistics` accesses were not coherently qualified. After qualifying them, some multi-token packets still showed group-local token disagreement.
+
+**Fix:** For M1 Max profiles above 8 workers, the packet argmax now has group 0 reduce the per-group maxima, publishes the selected token in the existing device-atomic control buffer, and has every group read it using zero-increment atomic RMW polling. The control barrier uses slots 0–2; the token uses slot 3. Metal rejected the release/acquire memory-order names; the token store and RMW use relaxed semantics after the global barrier. This path passed the full sampled validator, though the exact Metal/compiler visibility mechanism remains unproven. Added `--greedy-packet-steps` to `tests/validate_resident.py` for focused packet-vs-scalar checks, with optional `--capture-group-tokens` diagnostics.
+
+**Correctness procedure/results:** Ran the focused 32-worker greedy packet validator for 520 generated tokens, three fresh sessions; all logits, layer traces, and KV states matched scalar decode. The full `validate_resident.py` matrix then passed at both 8 and 32 workers. It covers the 34-token natural-language prompt, 513- and 8,192-token contexts, greedy and filtered sampling settings, presence penalties, EOS truncation, and cancellation; the 520-token greedy case checks native MLX on its first eight generated tokens and scalar/packet equality through the full run. These results do not validate sampled generation at the 256K context limit.
+
+**Sampled decode procedure:** The validator times 256 generated tokens after the 34-token prompt, with four repeats per mode; it discards the first timing and reports the median of the remaining three. Prefill is outside this decode timing. Rates below are packet-mode tokens/s:
+
+| Sampling mode | 8 workers | 32 workers | Change |
+| --- | ---: | ---: | ---: |
+| Greedy | 31.27 | 41.79 | +33.6% |
+| Temperature 0.6, unfiltered | 31.09 | 41.53 | +33.6% |
+| Temperature 1, unfiltered | 31.36 | 41.95 | +33.8% |
+| Temperature 0.6, top-p 0.95, top-k 20 | 30.45 | 40.53 | +33.1% |
+| Temperature 1, top-p 0.95, top-k 20 | 30.45 | 40.43 | +32.8% |
+| Temperature 1, top-p 0.95, top-k 20, presence penalty 1.5 | 30.42 | 40.46 | +33.0% |
+
+The separate 8K fixed-input benchmark remains the prefill/decode measurement: 516.19 prefill tok/s at 8 workers and 527.82 at 32; prefill uses the same native MLX path, so this small difference is run variation, not a worker effect. Its raw decode rates were 23.08 and 36.29 tok/s, respectively. Do not combine these prefill and decode rates.
+
+**Profile change:** Set the checked-in M1 Max resident worker count to 32; MLP and head workers remain 8. This is the fastest sampled-generation configuration measured here and passed the full sampling validator after the argmax publication fix. Other non-default counts 20, 24, 28, and 36 and full 256K sampled-generation correctness remain uncharacterized. Keep the 261,120-token prompt prohibited.
+
+**GPU interpretation:** The measured decode improvement shows headroom beyond the old 8-worker profile, but does not prove GPU saturation or unsaturation. Existing Instruments GPU-state/counter samples are GPU-wide and not process-attributed; no saturation claim is justified.
+
+**Final verification:** The full M1 `unittest` suite passed with the new default profile: 55 tests, 1 skipped. The 32-group coherent global-scratch payload stress passed three repeats. `py_compile` and `git diff --check` passed.

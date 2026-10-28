@@ -115,11 +115,11 @@ def same_kv(a, b):
     return all(mx.array_equal(x, y).item() for x, y in zip(a.banks, b.banks, strict=True))
 
 
-def validate_sustained_native(engine, model, steps, repeats):
+def validate_sustained_native(engine, model, steps, repeats, prompt_tokens=1):
     mx.eval(model.native.parameters())
     results = []
     token = 150006
-    prompt = [1]
+    prompt = [1] * prompt_tokens
     for repeat in range(repeats):
         session = engine.make_session(max_new_tokens=steps + 1)
         native_session = engine.make_session(max_new_tokens=steps + 1)
@@ -127,6 +127,7 @@ def validate_sustained_native(engine, model, steps, repeats):
         native_prefill_logits = native_session.prefill(prompt)
         assert mx.array_equal(logits, native_prefill_logits).item(), "Prefill logits differ"
         assert same_kv(session._state["kv"], native_session._state["kv"]), "Prefill KV differs"
+        native_session._state["kv"].grow(len(prompt) + steps + 1)
         native_cache = native_session.prompt_cache.layers
         for row, cache in zip(engine.metadata[:49], native_cache, strict=True):
             if not row[1]:
@@ -180,12 +181,147 @@ def validate_sustained_native(engine, model, steps, repeats):
                 print(json.dumps(detail), flush=True)
                 raise AssertionError("Native parity mismatch")
 
-        row = dict(repeat=repeat + 1, steps=steps, native_layer_checks=steps)
+        row = dict(
+            repeat=repeat + 1,
+            prompt_tokens=prompt_tokens,
+            steps=steps,
+            native_layer_checks=steps,
+        )
         results.append(row)
         print(json.dumps(row), flush=True)
         del session, native_session, native_cache
         mx.clear_cache()
     return results
+
+
+def validate_greedy_packet_once(engine, model, resident, prompt, steps, repeat):
+    captured = {}
+    original_kernel = resident.greedy_kernel
+
+    def capture(**kwargs):
+        outputs = original_kernel(**kwargs)
+        captured["logits"], captured["trace"] = outputs[:2]
+        return outputs
+
+    resident.greedy_kernel = capture
+    try:
+        reference = engine.make_session(max_new_tokens=steps + 1)
+        candidate = engine.make_session(max_new_tokens=steps + 1)
+        reference_logits = reference.prefill(prompt)
+        candidate_logits = candidate.prefill(prompt)
+        assert mx.array_equal(reference_logits, candidate_logits).item(), "Prefill logits differ"
+        assert same_kv(reference._state["kv"], candidate._state["kv"]), "Prefill KV differs"
+        token = int(mx.argmax(reference_logits.reshape(-1)).item())
+        position = packets = 0
+        while position < steps and token not in model.eos_tokens:
+            count = min((1, 3, 8)[packets % 3], steps - position)
+            packet_input = token
+            expected, logits, traces = [], [], []
+            for _ in range(count):
+                value, trace = engine.forward(reference._state, token)
+                token = int(mx.argmax(value.reshape(-1)).item())
+                expected.append(token)
+                logits.append(value)
+                traces.append(trace)
+                if token in model.eos_tokens:
+                    break
+            actual = resident.block(
+                candidate._state,
+                packet_input,
+                count,
+                42 + position,
+                temperature=0,
+            )
+            if actual != expected:
+                mismatch = next(
+                    (
+                        index
+                        for index, (found, wanted) in enumerate(zip(actual, expected))
+                        if found != wanted
+                    ),
+                    None,
+                )
+                if mismatch is None:
+                    detail = {
+                        "repeat": repeat,
+                        "prompt_tokens": len(prompt),
+                        "steps": steps,
+                        "packet_start": position,
+                        "packet_count": count,
+                        "packet_tokens": actual,
+                        "expected_tokens": expected,
+                    }
+                    print(json.dumps(detail), flush=True)
+                    raise AssertionError("Greedy resident packet length differs from scalar decode")
+                packet_logits = captured["logits"][mismatch]
+                packet_trace = captured["trace"][mismatch]
+                expected_logits, expected_trace = logits[mismatch], traces[mismatch]
+                mx.eval(packet_logits, packet_trace, expected_logits, expected_trace)
+                trace_unequal = mx.sum(packet_trace != expected_trace, axis=1).tolist()
+                difference = mx.abs(
+                    packet_logits.astype(mx.float32) - expected_logits.astype(mx.float32)
+                )
+                detail = {
+                    "repeat": repeat,
+                    "prompt_tokens": len(prompt),
+                    "steps": steps,
+                    "packet_start": position,
+                    "packet_count": count,
+                    "first_mismatch_offset": mismatch,
+                    "packet_tokens": actual,
+                    "expected_tokens": expected,
+                    "group_tokens_at_mismatch": (
+                        resident.last_group_tokens[mismatch]
+                        if getattr(resident, "capture_group_tokens", False)
+                        else None
+                    ),
+                    "logits_equal_at_mismatch": mx.array_equal(
+                        packet_logits, expected_logits
+                    ).item(),
+                    "logits_unequal_values": int(
+                        mx.sum(packet_logits != expected_logits).item()
+                    ),
+                    "logits_max_abs": float(mx.max(difference).item()),
+                    "trace_unequal_per_row": trace_unequal,
+                    "first_divergent_layer": next(
+                        (index - 1 for index, count in enumerate(trace_unequal) if count),
+                        None,
+                    ),
+                }
+                print(json.dumps(detail), flush=True)
+                raise AssertionError("Greedy resident packet differs from scalar decode")
+            for index in range(len(actual)):
+                assert mx.array_equal(captured["logits"][index], logits[index]).item(), (
+                    f"Packet logits differ at position {position + index}"
+                )
+                assert mx.array_equal(captured["trace"][index], traces[index]).item(), (
+                    f"Packet trace differs at position {position + index}"
+                )
+            assert reference._state["position"] == candidate._state["position"]
+            assert same_kv(reference._state["kv"], candidate._state["kv"]), "Packet KV differs"
+            position += len(actual)
+            packets += 1
+        print(
+            json.dumps(
+                {
+                    "repeat": repeat,
+                    "prompt_tokens": len(prompt),
+                    "steps": steps,
+                    "positions": position,
+                    "packets": packets,
+                    "packet_sizes": [1, 3, 8],
+                }
+            ),
+            flush=True,
+        )
+    finally:
+        resident.greedy_kernel = original_kernel
+
+
+def validate_greedy_packets(engine, model, resident, prompt, steps, repeats):
+    for repeat in range(repeats):
+        validate_greedy_packet_once(engine, model, resident, prompt, steps, repeat)
+        mx.clear_cache()
 
 
 def replace_shared_qkv_with_single_owner(
@@ -684,6 +820,23 @@ def main():
     )
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument(
+        "--greedy-packet-steps",
+        type=int,
+        default=0,
+        help="Compare greedy sampled packets with scalar decode for this many steps",
+    )
+    parser.add_argument(
+        "--capture-group-tokens",
+        action="store_true",
+        help="Capture each resident worker's sampled token for --greedy-packet-steps diagnostics",
+    )
+    parser.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=1,
+        help="Repeated token-1 prompt length for --sustained-steps validation",
+    )
+    parser.add_argument(
         "--stage-diagnostics",
         action="store_true",
         help="Compare layer-0 intermediate stages with native MLX and stop",
@@ -709,10 +862,23 @@ def main():
         help="In stage diagnostics, assign one Q/K/V head per group per globally synchronized round",
     )
     args = parser.parse_args()
-    if args.sustained_steps < 0 or args.repeats < 1:
-        parser.error("--sustained-steps must be nonnegative and --repeats must be positive")
-    if args.stage_diagnostics and (args.workers is None or args.sustained_steps):
-        parser.error("--stage-diagnostics requires --workers and cannot be combined with --sustained-steps")
+    if (
+        args.sustained_steps < 0
+        or args.repeats < 1
+        or args.prompt_tokens < 1
+        or args.greedy_packet_steps < 0
+    ):
+        parser.error("step counts must be nonnegative; repeats and prompt tokens must be positive")
+    if args.prompt_tokens != 1 and not args.sustained_steps:
+        parser.error("--prompt-tokens requires --sustained-steps")
+    if args.greedy_packet_steps and args.workers is None:
+        parser.error("--greedy-packet-steps requires an explicit --workers override")
+    if args.greedy_packet_steps and args.sustained_steps:
+        parser.error("choose either --greedy-packet-steps or --sustained-steps")
+    if args.capture_group_tokens and not args.greedy_packet_steps:
+        parser.error("--capture-group-tokens requires --greedy-packet-steps")
+    if args.stage_diagnostics and (args.workers is None or args.sustained_steps or args.greedy_packet_steps):
+        parser.error("--stage-diagnostics requires --workers and cannot be combined with step-validation modes")
     qkv_modes = (
         args.qkv_single_owner,
         args.qkv_single_owner_block,
@@ -787,7 +953,11 @@ def main():
         return
     if args.sustained_steps:
         validate_sustained_native(
-            engine, model, args.sustained_steps, args.repeats
+            engine,
+            model,
+            args.sustained_steps,
+            args.repeats,
+            prompt_tokens=args.prompt_tokens,
         )
         return
     tokenizer = AutoTokenizer.from_pretrained(
@@ -800,6 +970,17 @@ def main():
         add_generation_prompt=True,
         return_dict=False,
     )
+    if args.greedy_packet_steps:
+        if args.capture_group_tokens:
+            from rec_mlx.kernels.sampling import ResidentSampler
+
+            resident = ResidentSampler(
+                megakernel, engine, specification, capture_group_tokens=True
+            )
+        validate_greedy_packets(
+            engine, model, resident, prompt, args.greedy_packet_steps, args.repeats
+        )
+        return
     captured = {}
     persistent_kernel, greedy_kernel, filtered_run = (
         resident.kernel,

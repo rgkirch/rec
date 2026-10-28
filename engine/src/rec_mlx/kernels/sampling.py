@@ -15,12 +15,18 @@ def sampling_packet(keys, configuration):
 
 
 class ResidentSampler:
-    def __init__(self, module, engine, specification):
+    def __init__(self, module, engine, specification, *, capture_group_tokens=False):
         self.module, self.engine = module, engine
+        self.capture_group_tokens = capture_group_tokens
         assert engine.workers == engine.device_profile.workers
         assert engine.schedule["mlp"] == engine.device_profile.mlp_workers
         assert 1 <= len(engine.model.eos_tokens) <= 4
-        source = resident_transform(specification["source"], engine.workers)
+        source = resident_transform(
+            specification["source"],
+            engine.workers,
+            coherent_statistics=engine.device_profile.chip == "M1 Max" and engine.workers > 8,
+            capture_group_tokens=capture_group_tokens,
+        )
         old = "float value=float(logits[word]);"
         assert source.count(old) == 1
         source = source.replace("block_step<8u", "block_step<uint(sampling[0])")
@@ -135,7 +141,7 @@ if(stop)break;
                 (WIDTH, VOCAB),
                 (WIDTH, 50, 2048),
                 (engine.workers,),
-                (17,),
+                (17 + WIDTH * engine.workers if self.capture_group_tokens else 17,),
                 *module._scratch_layout(
                     module._LAYOUT["decode_scratch"],
                     {
@@ -161,6 +167,11 @@ if(stop)break;
             state["usable"] = False
             raise RuntimeError(f"Resident sampling synchronization failed: {diagnostic}")
         packet = out[3].tolist()
+        if self.capture_group_tokens:
+            self.last_group_tokens = [
+                packet[17 + step * engine.workers : 17 + (step + 1) * engine.workers]
+                for step in range(count)
+            ]
         produced = packet[16]
         assert 1 <= produced <= count
         pairs = packet[: 2 * produced]

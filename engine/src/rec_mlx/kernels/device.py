@@ -24,11 +24,11 @@ def profile_for_device(info):
     if identity not in chips:
         raise ValueError(f"Unsupported resident kernel device: {identity}")
     if chips[identity] == "M1 Max":
-        # Larger resident grids produce nondeterministic outputs on this architecture.
+        # 32 workers is the fastest M1 Max profile validated for sampled generation.
         return DeviceProfile(
             chip=chips[identity],
             architecture=architecture,
-            workers=8,
+            workers=32,
             mlp_workers=8,
             head_workers=8,
             prefill_chunk_size=2048,

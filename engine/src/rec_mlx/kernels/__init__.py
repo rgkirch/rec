@@ -17,13 +17,22 @@ def build_decoder(model, *, optimized):
         megakernel._HEADER = transform(megakernel._HEADER)
         from rec_mlx.kernels.mixed_bits import transform as qat_transform
 
-        captures = install(
-            megakernel,
-            profile,
-            post_transform=lambda h, b: qat_transform(
-                h, b, model, profile.mlp_workers, profile.specialize_mixed_experts
-            ),
-        )
+        def post_transform(header, body):
+            header, body = qat_transform(
+                header, body, model, profile.mlp_workers, profile.specialize_mixed_experts
+            )
+            # The shared-projection KV-team schedule covers M1 counts 12–36.
+            if profile.chip == "M1 Max" and profile.workers > 8:
+                if profile.workers not in range(12, 37, 4):
+                    raise ValueError(
+                        "Coherent resident scratch is only implemented for M1 worker counts 12–36 in steps of 4"
+                    )
+                from rec_mlx.kernels.coherent_scratch import transform as coherent_scratch
+
+                header, body = coherent_scratch(header, body)
+            return header, body
+
+        captures = install(megakernel, profile, post_transform=post_transform)
     if not optimized:
         from rec_mlx.kernels.mixed_bits import install as install_qat
 

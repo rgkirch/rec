@@ -6,15 +6,15 @@ import mlx.core as mx
 from rec_mlx.kernels import expert_teams, megakernel, mixed_bits, rank_routing
 from rec_mlx.kernels.device import profile_for_device
 from rec_mlx.kernels.kv_teams import function, transform as kv_teams_transform
+from rec_mlx.kernels.resident_block import transform as resident_block_transform
 from rec_mlx.kernels.resident_optimizations import transform as resident_transform
 
 
-def resident_device():
+def m4_m5_resident_device():
     try:
-        profile_for_device(mx.device_info())
+        return profile_for_device(mx.device_info()).chip in {"M4 Pro", "M5 Pro", "M5 Max"}
     except ValueError:
         return False
-    return True
 
 
 def selected_weights(probabilities, bias):
@@ -26,10 +26,17 @@ def selected_weights(probabilities, bias):
     return selected, chosen / (total + 1e-20)
 
 
+def m1_max_device():
+    try:
+        return profile_for_device(mx.device_info()).chip == "M1 Max"
+    except ValueError:
+        return False
+
+
 @unittest.skipUnless(mx.metal.is_available(), "requires Apple Metal")
 class RoutingTests(unittest.TestCase):
     @unittest.skipUnless(
-        mx.metal.is_available() and resident_device(), "requires M4 Pro, M5 Pro or M5 Max"
+        mx.metal.is_available() and m4_m5_resident_device(), "requires M4 Pro, M5 Pro or M5 Max"
     )
     def test_scores_survive_attention_scratch_reuse(self):
         probabilities = (mx.arange(256).astype(mx.float32) + 1) / 1024
@@ -107,12 +114,12 @@ class RoutingTests(unittest.TestCase):
                     self.assertEqual(routing[:, 14].tolist(), [123] * workers)
                     self.assertEqual(routing[:, 15].tolist(), [0xFFFFFFFF] * workers)
 
-    def test_m1_profile_uses_supported_eight_group_expert_teams(self):
+    def test_m1_profile_uses_32_resident_and_eight_expert_team_workers(self):
         profile = profile_for_device(
             {"architecture": "applegpu_g13s", "device_name": "Apple M1 Max"}
         )
         self.assertEqual(
-            (profile.workers, profile.mlp_workers, profile.head_workers), (8, 8, 8)
+            (profile.workers, profile.mlp_workers, profile.head_workers), (32, 8, 8)
         )
         header = expert_teams.transform(megakernel._HEADER, profile.mlp_workers)
         gateup = function(header, "expert_team_gateup")
@@ -156,6 +163,191 @@ class RoutingTests(unittest.TestCase):
             team_sync.count("atomic_fetch_add_explicit(team_control,0u,memory_order_relaxed)"),
             2,
         )
+
+    @unittest.skipUnless(
+        mx.metal.is_available() and m1_max_device(), "requires M1 Max Metal"
+    )
+    def test_m1_global_and_kv_team_barrier_payload_stress(self):
+        for workers in (8, 12):
+            for team_size in (None, workers // 4):
+                modes = (
+                    (("optimized", False), ("generation", True))
+                    if team_size is None
+                    else (("kv_team", False),)
+                )
+                for mode, original_barrier in modes:
+                    for coherent in (False, True):
+                        for repeat in range(3):
+                            with self.subTest(
+                                workers=workers,
+                                mode=mode,
+                                coherent=coherent,
+                                repeat=repeat + 1,
+                            ):
+                                payload, diagnostics, bad_peer_mask, _profile = (
+                                    self.run_barrier_payload_probe(
+                                        workers,
+                                        team_size,
+                                        original_barrier=original_barrier,
+                                        writer_coherent=coherent,
+                                        reader_coherent=coherent,
+                                    )
+                                )
+                                observed = diagnostics.tolist()
+                                details = (
+                                    f"diagnostics={observed} bad_peer_mask={bad_peer_mask.tolist()} "
+                                    f"payload={payload.tolist()}"
+                                )
+                                if workers == 12 and not coherent:
+                                    self.assertTrue(any(observed), msg=details)
+                                else:
+                                    self.assertEqual(observed, [0] * workers, msg=details)
+                                self.assertEqual(len(payload.tolist()), workers)
+
+    @unittest.skipUnless(
+        mx.metal.is_available() and m1_max_device(), "requires M1 Max Metal"
+    )
+    def test_m1_32_worker_coherent_global_scratch_visibility(self):
+        for repeat in range(3):
+            payload, diagnostics, bad_peer_mask, _profile = self.run_barrier_payload_probe(
+                32,
+                None,
+                writer_coherent=True,
+                reader_coherent=True,
+            )
+            self.assertEqual(
+                diagnostics.tolist(),
+                [0] * 32,
+                msg=f"repeat={repeat} mask={bad_peer_mask.tolist()} payload={payload.tolist()}",
+            )
+
+    @unittest.skipUnless(
+        mx.metal.is_available() and m1_max_device(), "requires M1 Max Metal"
+    )
+    def test_m1_resident_sampling_argmax_qualifies_cross_group_statistics(self):
+        source = megakernel._BODY.replace("__PROFILE__", "0")
+        ordinary = resident_block_transform(source, 32)
+        coherent = resident_block_transform(
+            source, 32, coherent_statistics=True
+        )
+        captured = resident_block_transform(
+            source, 32, coherent_statistics=True, capture_group_tokens=True
+        )
+        self.assertIn("statistics[group*2]=maximum;", ordinary)
+        self.assertIn("float other=statistics[peer*2];", ordinary)
+        self.assertIn(
+            "((device coherent(device) float*)statistics)[group*2]=maximum;",
+            coherent,
+        )
+        self.assertIn(
+            "float other=((device coherent(device) float*)statistics)[peer*2];",
+            coherent,
+        )
+        self.assertIn(
+            "((device coherent(device) uint*)statistics)[group*2+1]=choice;",
+            coherent,
+        )
+        self.assertIn(
+            "uint other_word=((device coherent(device) uint*)statistics)[peer*2+1];",
+            coherent,
+        )
+        self.assertIn(
+            "atomic_store_explicit(control+3,choice,memory_order_relaxed);",
+            coherent,
+        )
+        self.assertIn(
+            "atomic_fetch_add_explicit(control+3,0u,memory_order_relaxed)",
+            coherent,
+        )
+        self.assertIn("profile[17u+block_step*32u+group]=block_input_token;", captured)
+
+    def run_barrier_payload_probe(
+        self,
+        workers,
+        team_size,
+        iterations=256,
+        original_barrier=False,
+        writer_coherent=False,
+        reader_coherent=False,
+    ):
+        if original_barrier:
+            header = megakernel._HEADER
+            header = header.replace("__WORKERS__", str(workers))
+            header = header.replace("__PROFILE__", "0")
+        else:
+            header = resident_transform(megakernel._HEADER)
+            header = header.replace("__WORKERS__", str(workers))
+            header = header.replace("__PROFILE__", "0")
+            header = header.replace("__ATTENTION_GROUPS__", str(workers * 8))
+            header = header.replace("__MERGE_GROUPS__", str(workers * 8))
+        if team_size is None:
+            sync_name = "sync_all"
+            sync_header = function(header, sync_name)
+            team_start, team_count = 0, workers
+        else:
+            body = megakernel._BODY.replace("__WORKERS__", str(workers))
+            body = body.replace("__MERGE_WORKERS__", str(workers))
+            team_header, _ = kv_teams_transform(header, body, workers)
+            sync_name = "kv_team_sync"
+            sync_header = function(team_header, sync_name)
+            team_start = f"(group/{team_size})*{team_size}"
+            team_count = team_size
+        coherent_pointer = (
+            "device coherent(device) uint* coherent_payload=(device coherent(device) uint*)payload;"
+            if writer_coherent or reader_coherent
+            else ""
+        )
+        write_pointer = "coherent_payload" if writer_coherent else "payload"
+        read_pointer = "coherent_payload" if reader_coherent else "payload"
+        source = f"""
+            uint tid=thread_index_in_threadgroup;
+            uint group=threadgroup_position_in_grid.x;
+            device atomic_uint* control=(device atomic_uint*)private_control;
+            {coherent_pointer}
+            threadgroup uint ready[1];
+            uint phase=0,mismatches=0;
+            for(uint iteration=0;iteration<{iterations}u;++iteration) {{
+                if(tid==0)
+                    {write_pointer}[group]=((iteration+1u)*97u)^((group+1u)*2654435761u);
+                if(!{sync_name}(control,tid,phase,ready,profile,group)) {{
+                    if(tid==0)diagnostic[group]=0x80000000u|phase;
+                    return;
+                }}
+                if(tid==0) {{
+                    uint first={team_start},bad_mask=0;
+                    for(uint peer=first;peer<first+{team_count}u;++peer) {{
+                        uint expected=((iteration+1u)*97u)^((peer+1u)*2654435761u);
+                        if({read_pointer}[peer]!=expected) {{
+                            ++mismatches;
+                            if(iteration==0)bad_mask|=1u<<peer;
+                        }}
+                    }}
+                    if(iteration==0)bad_peer_mask[group]=bad_mask;
+                }}
+                if(!{sync_name}(control,tid,phase,ready,profile,group)) {{
+                    if(tid==0)diagnostic[group]=0x80000000u|phase;
+                    return;
+                }}
+            }}
+            if(tid==0)diagnostic[group]=mismatches;
+        """
+        kernel = megakernel._metal(
+            name=f"m1_{sync_name}_payload_stress_{workers}_{'generation' if original_barrier else 'optimized'}_w{int(writer_coherent)}r{int(reader_coherent)}",
+            input_names=["private_control"],
+            output_names=["payload", "diagnostic", "bad_peer_mask", "profile"],
+            header=sync_header,
+            source=source,
+            compile_options={"math_mode": "safe"},
+        )
+        outputs = kernel(
+            inputs=[mx.zeros((1024,), mx.uint32)],
+            output_shapes=[(workers,), (workers,), (workers,), (workers * iterations * 2,)],
+            output_dtypes=[mx.uint32, mx.uint32, mx.uint32, mx.uint32],
+            grid=(workers * 256, 1, 1),
+            threadgroup=(256, 1, 1),
+        )
+        mx.eval(*outputs)
+        return outputs
 
     def test_native_bf16_expert_reduction(self):
         for workers in (32, 64):
