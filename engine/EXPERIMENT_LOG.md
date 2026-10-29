@@ -388,3 +388,21 @@ The separate 8K fixed-input benchmark remains the prefill/decode measurement: 51
 **Focused controls:** Ran the existing barrier payload probe at 36 workers for 16 iterations with coherent writer and reader pointers. Both the global barrier and the KV-team barrier with team size 9 completed with zero diagnostics. These small probes do not reproduce the full megakernel's scratch/register/resource conditions, so they do not explain the decode failure.
 
 **Conclusion:** The 36-worker M1 schedule is not validated and must not be used or benchmarked as a candidate yet. The coherent transform's supported range through 36 is not evidence of runtime correctness. The failure is consistent with a synchronization/resource issue in the full schedule, but its cause is unknown; it does not establish a hardware worker ceiling. Keep the default at the measured-and-validated 32 workers.
+
+### 2026-10-28 — Follow-up attempts to make 36 workers run
+
+**Configuration/runtime:** Rec commit `c0dbac2`, clean worktree before the experiments; M1 Max `workers=36`, `mlp_workers=8`, `head_workers=8`; mirrored Flint INT4 checkpoint; project `.venv` with MLX 0.32.0. All source variations below were in-memory test-only transforms; no runtime source or profile was changed.
+
+**Barrier-phase capture:** The normal `profile=True` path is rejected by `kv_teams.transform` with `Global profiling must be disabled`. For this diagnostic only, disabled profiling in the copied KV-team barrier while retaining global barrier profiling. The full-kernel phase-0 arrival values covered all 36 groups (0–35). Groups 0–31 recorded roughly 9.28M–10M spins; groups 32–35 recorded zero spins. The kernel still failed with diagnostic 1 for all 36 groups, and the profile sentinel remained unset. This localizes the original failure to the first global barrier after embedding and shows a large arrival/wait asymmetry; it does not establish the exact scheduling mechanism.
+
+**Targeted variations:**
+
+- Recompiled the unoptimized schedule without the fast-exp activation transform; the first scalar decode still failed with diagnostic 1 for all 36 groups.
+- Increased the global/KV barrier spin limit from 10M to 50M in a test-only transform; the first scalar decode still failed, reporting `[1333788672, 0, ...]`. This is not a successful or interpretable correctness result and is not a proposed fix.
+- Removed only the post-embedding `SYNC()` in a test-only body. The decode still failed at the next global synchronization, with diagnostic values 1 for groups 0–31 and 2 for groups 32–35.
+- Marked the attention partial/merge, routing, and RMS helpers `noinline` after the coherent-scratch transform; the first scalar decode still failed with diagnostic 1 for all 36 groups. A second build also marked the coherent Q4 helpers `noinline`; it failed with the same diagnostic.
+- A separate 36-group global-barrier probe with threadgroup arrays totaling about 4.4 KB passed. This is a small control and does not reproduce the full decoder's register/call-graph footprint.
+
+**Hardware observation:** `system_profiler SPDisplaysDataType` reports 32 GPU cores on this M1 Max. This fact plus the full-kernel arrival/wait pattern is consistent with a 32-group effective residency limit for this fused shader, but does not prove a general hardware maximum.
+
+**Conclusion:** No 36-worker fix was found; no throughput result exists. The current fused decoder uses device-wide spin barriers and the tested 36-worker full kernel does not pass them, even though isolated barrier probes pass. The evidence points to a full-kernel residency/resource constraint; its exact cause is unresolved. Supporting 36 now requires a further resource-footprint change or a synchronization/dispatch redesign, neither validated here. Keep the checked-in M1 profile at 32; 32 remains fastest tested and validated, not a proven hardware-wide ceiling.
