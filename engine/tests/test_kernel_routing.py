@@ -5,7 +5,8 @@ import mlx.core as mx
 
 from rec_mlx.kernels import expert_teams, megakernel, mixed_bits, rank_routing
 from rec_mlx.kernels.device import profile_for_device
-from rec_mlx.kernels.kv_teams import function, transform as kv_teams_transform
+from rec_mlx.kernels.kv_teams import function
+from rec_mlx.kernels.kv_teams import transform as kv_teams_transform
 from rec_mlx.kernels.resident_block import transform as resident_block_transform
 from rec_mlx.kernels.resident_optimizations import transform as resident_transform
 
@@ -114,20 +115,18 @@ class RoutingTests(unittest.TestCase):
                     self.assertEqual(routing[:, 14].tolist(), [123] * workers)
                     self.assertEqual(routing[:, 15].tolist(), [0xFFFFFFFF] * workers)
 
-    def test_m1_profile_uses_32_resident_and_eight_expert_team_workers(self):
+    def test_m1_profile_uses_32_resident_mlp_and_head_workers(self):
         profile = profile_for_device(
             {"architecture": "applegpu_g13s", "device_name": "Apple M1 Max"}
         )
-        self.assertEqual(
-            (profile.workers, profile.mlp_workers, profile.head_workers), (32, 8, 8)
-        )
+        self.assertEqual((profile.workers, profile.mlp_workers, profile.head_workers), (32, 32, 32))
         header = expert_teams.transform(megakernel._HEADER, profile.mlp_workers)
         gateup = function(header, "expert_team_gateup")
         handoff = function(header, "expert_team_handoff")
-        self.assertIn("bool shared=group>=6;", gateup)
-        self.assertIn("uint teams=shared?2:1", gateup)
-        self.assertIn("uint first=group>=6?6", handoff)
-        self.assertIn("count=group>=6?2:1", handoff)
+        self.assertIn("bool shared=group>=24;", gateup)
+        self.assertIn("uint teams=shared?8:4", gateup)
+        self.assertIn("uint first=group>=24?24", handoff)
+        self.assertIn("count=group>=24?8:4", handoff)
         legacy_sync = function(megakernel._HEADER, "sync_all")
         self.assertIn(
             "atomic_fetch_add_explicit(control+1,0u,memory_order_relaxed)==phase",
@@ -144,9 +143,7 @@ class RoutingTests(unittest.TestCase):
         optimized_header = optimized_header.replace(
             "__ATTENTION_GROUPS__", str(profile.workers * 8)
         )
-        optimized_header = optimized_header.replace(
-            "__MERGE_GROUPS__", str(profile.workers * 8)
-        )
+        optimized_header = optimized_header.replace("__MERGE_GROUPS__", str(profile.workers * 8))
         sync = function(optimized_header, "sync_all")
         self.assertEqual(
             sync.count("atomic_fetch_add_explicit(control,0u,memory_order_relaxed)"), 2
@@ -164,9 +161,7 @@ class RoutingTests(unittest.TestCase):
             2,
         )
 
-    @unittest.skipUnless(
-        mx.metal.is_available() and m1_max_device(), "requires M1 Max Metal"
-    )
+    @unittest.skipUnless(mx.metal.is_available() and m1_max_device(), "requires M1 Max Metal")
     def test_m1_global_and_kv_team_barrier_payload_stress(self):
         for workers in (8, 12):
             for team_size in (None, workers // 4):
@@ -204,9 +199,7 @@ class RoutingTests(unittest.TestCase):
                                     self.assertEqual(observed, [0] * workers, msg=details)
                                 self.assertEqual(len(payload.tolist()), workers)
 
-    @unittest.skipUnless(
-        mx.metal.is_available() and m1_max_device(), "requires M1 Max Metal"
-    )
+    @unittest.skipUnless(mx.metal.is_available() and m1_max_device(), "requires M1 Max Metal")
     def test_m1_32_worker_coherent_global_scratch_visibility(self):
         for repeat in range(3):
             payload, diagnostics, bad_peer_mask, _profile = self.run_barrier_payload_probe(
@@ -221,15 +214,11 @@ class RoutingTests(unittest.TestCase):
                 msg=f"repeat={repeat} mask={bad_peer_mask.tolist()} payload={payload.tolist()}",
             )
 
-    @unittest.skipUnless(
-        mx.metal.is_available() and m1_max_device(), "requires M1 Max Metal"
-    )
+    @unittest.skipUnless(mx.metal.is_available() and m1_max_device(), "requires M1 Max Metal")
     def test_m1_resident_sampling_argmax_qualifies_cross_group_statistics(self):
         source = megakernel._BODY.replace("__PROFILE__", "0")
         ordinary = resident_block_transform(source, 32)
-        coherent = resident_block_transform(
-            source, 32, coherent_statistics=True
-        )
+        coherent = resident_block_transform(source, 32, coherent_statistics=True)
         captured = resident_block_transform(
             source, 32, coherent_statistics=True, capture_group_tokens=True
         )
