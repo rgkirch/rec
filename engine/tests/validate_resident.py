@@ -194,6 +194,47 @@ def validate_sustained_native(engine, model, steps, repeats, prompt_tokens=1):
     return results
 
 
+def validate_repeated_prefill(
+    engine, prompt, repeats, max_new_tokens=13, prefill_third_session=False
+):
+    for repeat in range(repeats):
+        reference = engine.make_session(max_new_tokens=max_new_tokens)
+        candidate = engine.make_session(max_new_tokens=max_new_tokens)
+        reference_logits = reference.prefill(prompt)
+        candidate_logits = candidate.prefill(prompt)
+        third_session = None
+        third_logits = None
+        if prefill_third_session:
+            third_session = engine.make_session(max_new_tokens=max_new_tokens)
+            third_logits = third_session.prefill(prompt)
+        equal = mx.array_equal(reference_logits, candidate_logits).item()
+        detail = {
+            "repeat": repeat + 1,
+            "prompt_tokens": len(prompt),
+            "logits_equal": equal,
+            "reference_argmax": int(mx.argmax(reference_logits.reshape(-1)).item()),
+            "candidate_argmax": int(mx.argmax(candidate_logits.reshape(-1)).item()),
+            "reference_kv_capacity": reference._state["kv"].capacity,
+            "candidate_kv_capacity": candidate._state["kv"].capacity,
+        }
+        if third_logits is not None:
+            detail["third_session_logits_equal"] = mx.array_equal(
+                reference_logits, third_logits
+            ).item()
+        if not equal:
+            difference = mx.abs(
+                reference_logits.astype(mx.float32) - candidate_logits.astype(mx.float32)
+            )
+            detail.update(
+                logits_unequal=int(mx.sum(reference_logits != candidate_logits).item()),
+                logits_max_abs=float(mx.max(difference).item()),
+            )
+        print(json.dumps(detail), flush=True)
+        assert equal, "Repeated prefill logits differ"
+        del reference, candidate, third_session, third_logits
+        mx.clear_cache()
+
+
 def validate_greedy_packet_once(engine, model, resident, prompt, steps, repeat):
     captured = {}
     original_kernel = resident.greedy_kernel
@@ -208,17 +249,63 @@ def validate_greedy_packet_once(engine, model, resident, prompt, steps, repeat):
         reference = engine.make_session(max_new_tokens=steps + 1)
         candidate = engine.make_session(max_new_tokens=steps + 1)
         reference_logits = reference.prefill(prompt)
+        from rec_mlx.cache import copy_array
+
+        reference_snapshot = copy_array(reference_logits)
         candidate_logits = candidate.prefill(prompt)
-        assert mx.array_equal(reference_logits, candidate_logits).item(), "Prefill logits differ"
+        reference_output_unchanged = mx.array_equal(
+            reference_logits, reference_snapshot
+        ).item()
+        if not mx.array_equal(reference_snapshot, candidate_logits).item():
+            difference = mx.abs(
+                reference_snapshot.astype(mx.float32) - candidate_logits.astype(mx.float32)
+            )
+            detail = {
+                "repeat": repeat,
+                "prompt_tokens": len(prompt),
+                "reference_argmax": int(mx.argmax(reference_snapshot).item()),
+                "candidate_argmax": int(mx.argmax(candidate_logits).item()),
+                "reference_output_unchanged": reference_output_unchanged,
+                "logits_unequal": int(
+                    mx.sum(reference_snapshot != candidate_logits).item()
+                ),
+                "logits_max_abs": float(mx.max(difference).item()),
+                "reference_kv_capacity": reference._state["kv"].capacity,
+                "candidate_kv_capacity": candidate._state["kv"].capacity,
+            }
+            print(json.dumps(detail), flush=True)
+            raise AssertionError("Repeated prefill logits differ")
         assert same_kv(reference._state["kv"], candidate._state["kv"]), "Prefill KV differs"
-        token = int(mx.argmax(reference_logits.reshape(-1)).item())
-        position = packets = 0
+        native_session = engine.make_session(max_new_tokens=steps + 1)
+        native_logits = native_session.prefill(prompt)
+        assert mx.array_equal(reference_snapshot, native_logits).item(), "Native prefill logits differ"
+        native_session._state["kv"].grow(len(prompt) + steps + 1)
+        native_cache = native_session.prompt_cache.layers
+        for row, cache in zip(engine.metadata[:49], native_cache, strict=True):
+            if not row[1]:
+                cache.grow(len(prompt) + steps + 1)
+        token = int(mx.argmax(reference_snapshot.reshape(-1)).item())
+        position = packets = native_checks = 0
         while position < steps and token not in model.eos_tokens:
             count = min((1, 3, 8)[packets % 3], steps - position)
             packet_input = token
             expected, logits, traces = [], [], []
-            for _ in range(count):
+            for offset in range(count):
                 value, trace = engine.forward(reference._state, token)
+                if position + offset < 8:
+                    hidden = model.native.model.embed_tokens(mx.array([[token]], mx.int32))
+                    native_trace = [hidden.reshape(-1)]
+                    for layer, cache in zip(model.native.layers, native_cache, strict=True):
+                        hidden = layer(hidden, None, cache)
+                        native_trace.append(hidden.reshape(-1))
+                    native_output = model.native.lm_head(model.native.model.norm(hidden))
+                    assert mx.array_equal(mx.stack(native_trace), trace).item(), (
+                        "Native layer mismatch"
+                    )
+                    assert mx.array_equal(native_output.reshape(-1), value).item(), (
+                        "Native logits mismatch"
+                    )
+                    native_checks += 1
                 token = int(mx.argmax(value.reshape(-1)).item())
                 expected.append(token)
                 logits.append(value)
@@ -309,6 +396,8 @@ def validate_greedy_packet_once(engine, model, resident, prompt, steps, repeat):
                     "steps": steps,
                     "positions": position,
                     "packets": packets,
+                    "native_checks": native_checks,
+                    "reference_output_unchanged": reference_output_unchanged,
                     "packet_sizes": [1, 3, 8],
                 }
             ),
@@ -831,6 +920,22 @@ def main():
         help="Capture each resident worker's sampled token for --greedy-packet-steps diagnostics",
     )
     parser.add_argument(
+        "--packet-prompt-tokens",
+        type=int,
+        default=0,
+        help="Use a token-1 prefix plus the normal chat prompt for packet or prefill checks",
+    )
+    parser.add_argument(
+        "--repeat-prefill",
+        action="store_true",
+        help="Compare direct logits from fresh prefills without decoding",
+    )
+    parser.add_argument(
+        "--prefill-third-session",
+        action="store_true",
+        help="Prefill a third session before comparison in --repeat-prefill diagnostics",
+    )
+    parser.add_argument(
         "--prompt-tokens",
         type=int,
         default=1,
@@ -867,17 +972,29 @@ def main():
         or args.repeats < 1
         or args.prompt_tokens < 1
         or args.greedy_packet_steps < 0
+        or args.packet_prompt_tokens < 0
     ):
         parser.error("step counts must be nonnegative; repeats and prompt tokens must be positive")
     if args.prompt_tokens != 1 and not args.sustained_steps:
         parser.error("--prompt-tokens requires --sustained-steps")
-    if args.greedy_packet_steps and args.workers is None:
-        parser.error("--greedy-packet-steps requires an explicit --workers override")
+    if (args.greedy_packet_steps or args.repeat_prefill) and args.workers is None:
+        parser.error("packet and repeated-prefill checks require an explicit --workers override")
     if args.greedy_packet_steps and args.sustained_steps:
         parser.error("choose either --greedy-packet-steps or --sustained-steps")
+    if args.repeat_prefill and (args.greedy_packet_steps or args.sustained_steps):
+        parser.error("--repeat-prefill cannot be combined with decode validation")
+    if args.prefill_third_session and not args.repeat_prefill:
+        parser.error("--prefill-third-session requires --repeat-prefill")
     if args.capture_group_tokens and not args.greedy_packet_steps:
         parser.error("--capture-group-tokens requires --greedy-packet-steps")
-    if args.stage_diagnostics and (args.workers is None or args.sustained_steps or args.greedy_packet_steps):
+    if args.packet_prompt_tokens and not (args.greedy_packet_steps or args.repeat_prefill):
+        parser.error("--packet-prompt-tokens requires packet or repeated-prefill validation")
+    if args.stage_diagnostics and (
+        args.workers is None
+        or args.sustained_steps
+        or args.greedy_packet_steps
+        or args.repeat_prefill
+    ):
         parser.error("--stage-diagnostics requires --workers and cannot be combined with step-validation modes")
     qkv_modes = (
         args.qkv_single_owner,
@@ -970,6 +1087,18 @@ def main():
         add_generation_prompt=True,
         return_dict=False,
     )
+    if args.packet_prompt_tokens:
+        if args.packet_prompt_tokens < len(prompt):
+            parser.error("--packet-prompt-tokens must be at least the natural prompt length")
+        prompt = [1] * (args.packet_prompt_tokens - len(prompt)) + prompt
+    if args.repeat_prefill:
+        validate_repeated_prefill(
+            engine,
+            prompt,
+            args.repeats,
+            prefill_third_session=args.prefill_third_session,
+        )
+        return
     if args.greedy_packet_steps:
         if args.capture_group_tokens:
             from rec_mlx.kernels.sampling import ResidentSampler

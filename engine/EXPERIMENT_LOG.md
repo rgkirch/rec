@@ -364,3 +364,17 @@ The separate 8K fixed-input benchmark remains the prefill/decode measurement: 51
 **GPU interpretation:** The measured decode improvement shows headroom beyond the old 8-worker profile, but does not prove GPU saturation or unsaturation. Existing Instruments GPU-state/counter samples are GPU-wide and not process-attributed; no saturation claim is justified.
 
 **Final verification:** The full M1 `unittest` suite passed with the new default profile: 55 tests, 1 skipped. The 32-group coherent global-scratch payload stress passed three repeats. `py_compile` and `git diff --check` passed.
+
+### 2026-10-28 — 196,608-token prefill mismatch not reproduced
+
+**Original observation:** At `workers=32`, `mlp_workers=8`, `head_workers=8`, an earlier direct comparison of two fresh prefills at 196,608 tokens failed: 97,925 logits differed, maximum absolute difference 0.75, while both argmax IDs were 150006 and both KV capacities were 196,608. The prompt was token ID 1 repeated as a prefix, followed by the same 34-token chat prompt used by the packet validator. This did not establish whether the discrepancy came from inference or the validation harness.
+
+**Diagnostic harness:** Added `--repeat-prefill` to run only the direct two-session prefill comparison, without decode, plus `--prefill-third-session` to reproduce the original ordering where a third fresh prefill occurs before comparing the first two. The mode uses a 13-token output allowance and reports exact logit equality, argmax, and KV capacities. It does not compare KV contents.
+
+**Short control:** At the natural 34-token prompt, two fresh prefills matched exactly.
+
+**Reproduction attempts:** At the same 196,608-token prompt and profile, the direct no-snapshot prefill check passed three times across two invocations. The original three-session ordering also passed once; the third session's logits matched the first. Thus the earlier discrepancy was not reproduced. No reduced-context search was run because there was no reproducible failing case to minimize.
+
+**Related long-context results:** One sampled-packet run at 229,376 tokens completed 12 positions in three packets and matched scalar decode; the first eight positions also matched native MLX layer traces and logits. This was a single synthetic prompt check, not general 229K parity. The 245,760- and 262,131-token runs were terminated without results. A separate three-repeat sampled-packet attempt at 196,608 tokens completed one passing repeat and timed out before the remaining repeats. No 261,120-token prompt was run.
+
+**Conclusion:** The initial 196,608-token mismatch remains unexplained and must not be described as fixed or as a confirmed inference bug. The repeat-prefill diagnostic did not reproduce it, so there is no minimized failure yet. No full-context sampled-generation or peak-memory result was obtained. At these runs, Rec was at `49ebf77` with uncommitted validation-harness edits.
