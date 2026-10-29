@@ -357,8 +357,8 @@ func TestManifestSchemaAndPaths(t *testing.T) {
 
 func TestAppleChipAllowlist(t *testing.T) {
 	for chip, ok := range map[string]bool{
-		"Apple M1 Max": true, "Apple M4 Pro": true, "Apple M5 Pro": true, "Apple M5 Max": true,
-		"Apple M1 Pro": false, "Apple M4 Max": false, "Apple M4": false,
+		"Apple M1 Max": true, "Apple M4 Pro": true, "Apple M4 Max": true, "Apple M5 Pro": true, "Apple M5 Max": true,
+		"Apple M1 Pro": false, "Apple M4": false,
 	} {
 		if (checkAppleChip(chip) == nil) != ok {
 			t.Fatalf("%s: want supported=%t", chip, ok)

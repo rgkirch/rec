@@ -286,6 +286,15 @@ class ServingTest(unittest.TestCase):
             conn.close()
         self.assertEqual(self.request("C")[0], 503)
 
+    def test_listen_backlog_holds_a_burst_of_connections(self):
+        # Connections beyond the backlog are reset (macOS) or dropped (Linux) before a handler runs.
+        self.server.shutdown()
+        clients = [
+            socket.create_connection(self.server.server_address, timeout=5) for _ in range(16)
+        ]
+        for client in clients:
+            client.close()
+
     def test_queue_capacity_rejects_excess_and_preserves_admitted_requests(self):
         first = self.pool.submit(self.request, "A", max_tokens=1)
         self.assertTrue(self.engine.started.wait(3))
@@ -335,6 +344,149 @@ class ServingTest(unittest.TestCase):
         ) as generate:
             self.assertEqual(self.request("B", max_tokens=1, presence_penalty=1.5)[0], 200)
             self.assertEqual(generate.call_args.args[1].presence_penalty, 1.5)
+
+    def messages(self, body, headers=None):
+        conn = http.client.HTTPConnection(*self.server.server_address, timeout=5)
+        try:
+            conn.request(
+                "POST",
+                "/v1/messages",
+                json.dumps(body),
+                {"Content-Type": "application/json", **(headers or {})},
+            )
+            response = conn.getresponse()
+            raw = response.read().decode()
+            return response.status, raw if body.get("stream") else json.loads(raw)
+        finally:
+            conn.close()
+
+    def test_messages_translates_onto_the_chat_path(self):
+        seen = {}
+
+        def prompt(messages, tools=None):
+            seen["messages"] = messages
+            seen["tools"] = tools
+            return [ord("B")]
+
+        body = {
+            "model": "flint",
+            "max_tokens": 1,
+            "system": "Be brief",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "B"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": "sunny",
+                        },
+                    ],
+                }
+            ],
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+                }
+            ],
+            "service_tier": "auto",
+        }
+        with (
+            patch.object(self.engine, "prompt", side_effect=prompt),
+            self.assertLogs(level="WARNING") as logs,
+        ):
+            status, message = self.messages(body)
+            self.assertEqual(self.messages(body)[0], 200)
+        self.assertEqual(status, 200)
+        self.assertEqual(seen["messages"][0], {"role": "system", "content": "Be brief"})
+        self.assertEqual(seen["messages"][1]["content"], "B")
+        self.assertEqual(seen["messages"][2]["role"], "tool")
+        self.assertEqual(seen["tools"][0]["function"]["name"], "get_weather")
+        self.assertEqual(message["type"], "message")
+        self.assertEqual(message["content"], [{"type": "text", "text": "x"}])
+        self.assertEqual(message["stop_reason"], "max_tokens")
+        self.assertEqual(message["usage"]["output_tokens"], 1)
+        self.assertEqual(message["usage"]["input_tokens"], 1)
+        self.assertEqual(
+            logs.output, ["WARNING:root:Ignoring unsupported request field 'service_tier'"]
+        )
+        self.assertEqual(self.messages({**body, "tool_choice": {"type": "any"}})[0], 400)
+        self.assertEqual(self.engine.calls[-1][0], "B")
+
+    def test_messages_stream_uses_the_event_sequence(self):
+        status, raw = self.messages(
+            {
+                "model": "flint",
+                "max_tokens": 2,
+                "messages": [{"role": "user", "content": "B"}],
+                "stream": True,
+            }
+        )
+        self.assertEqual(status, 200)
+        names = [
+            line.removeprefix("event: ") for line in raw.splitlines() if line.startswith("event: ")
+        ]
+        self.assertEqual(names[0], "message_start")
+        self.assertIn("content_block_delta", names)
+        self.assertEqual(names[-2:], ["message_delta", "message_stop"])
+        delta = json.loads(raw.split("event: message_delta\ndata: ", 1)[1].split("\n", 1)[0])
+        self.assertEqual(delta["delta"]["stop_reason"], "max_tokens")
+        self.assertEqual(delta["usage"]["output_tokens"], 2)
+
+    def test_messages_translates_errors_raised_before_generation(self):
+        first = self.pool.submit(self.request, "A", max_tokens=2)
+        self.assertTrue(self.engine.started.wait(3))
+        body = {"model": "flint", "max_tokens": 2, "messages": [{"role": "user", "content": "B"}]}
+        second = self.pool.submit(self.messages, body)
+        self.wait_queued()
+        self.server.generator.cancel()
+        self.server.generator.join()
+        self.assertEqual(first.result()[0], 200)
+        status, payload = second.result()
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["type"], "error")
+        self.assertEqual(payload["error"]["type"], "overloaded_error")
+
+    def test_messages_accepts_bearer_token_or_api_key(self):
+        server = make_server(
+            self.engine, ("127.0.0.1", 0), Path(self.temp.name) / "metrics-auth", api_key="secret"
+        )
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        body = json.dumps(
+            {"model": "flint", "max_tokens": 1, "messages": [{"role": "user", "content": "B"}]}
+        )
+
+        def post(path, headers):
+            conn = http.client.HTTPConnection(*server.server_address, timeout=5)
+            try:
+                conn.request("POST", path, body, {"Content-Type": "application/json", **headers})
+                response = conn.getresponse()
+                payload = json.loads(response.read())
+                return response.status, payload
+            finally:
+                conn.close()
+
+        try:
+            status, payload = post("/v1/messages", {})
+            self.assertEqual(status, 401)
+            self.assertEqual(payload["error"]["type"], "authentication_error")
+            self.assertEqual(post("/v1/messages", {"x-api-key": "secret"})[0], 200)
+            # The Anthropic SDK and Claude Code add a query string.
+            self.assertEqual(post("/v1/messages?beta=true", {"x-api-key": "secret"})[0], 200)
+            self.assertEqual(post("/v1/messages", {"Authorization": "Bearer secret"})[0], 200)
+            self.assertEqual(post("/v1/chat/completions", {"x-api-key": "secret"})[0], 401)
+            self.assertEqual(
+                post("/v1/chat/completions", {"Authorization": "Bearer secret"})[0], 200
+            )
+        finally:
+            server.shutdown()
+            server.generator.cancel()
+            server.generator.join()
+            server.server_close()
+            thread.join()
 
 
 if __name__ == "__main__":

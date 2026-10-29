@@ -26,7 +26,7 @@ excluded.</sub></p>
 
 ## Requirements
 
-- Apple Silicon Mac with an M1 Max (64 GB), M4 Pro, M5 Pro, or M5 Max
+- Apple Silicon Mac with an M1 Max (64 GB), M4 Pro, M4 Max, M5 Pro, or M5 Max
 - At least 48 GB unified memory
 - About 30 GB free disk space
 - [Node.js 22](https://nodejs.org/en/download) and npm for pi
@@ -74,7 +74,8 @@ rec exec pi install npm:PACKAGE
 
 ### Use your own harness
 
-`rec` exposes an OpenAI-compatible chat-completions API. Start the server:
+`rec` exposes OpenAI and Anthropic-compatible chat-completion APIs.
+Start the server:
 
 ```bash
 rec serve
@@ -95,7 +96,7 @@ instead of running it. Replace the harness path with the path to your own
 harness. The command also points the harness at rec's own settings and
 sessions; remove those variables to keep yours.
 
-To send a request directly:
+To send a request directly to the OpenAI-compatible API:
 
 ```bash
 curl -fsS http://127.0.0.1:11500/v1/chat/completions \
@@ -107,6 +108,11 @@ curl -fsS http://127.0.0.1:11500/v1/chat/completions \
 The response contains generated text in `choices`. For other clients, use
 base URL `http://127.0.0.1:11500/v1`, model `flint`, and the API key from
 `rec auth token`.
+
+The Anthropic-compatible API is available at
+`http://127.0.0.1:11500/v1/messages`. Point `ANTHROPIC_BASE_URL` at
+`http://127.0.0.1:11500` and send the token from `rec auth token` as a bearer
+token or as `x-api-key`. The model is `flint`.
 
 
 ## Commands
