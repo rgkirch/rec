@@ -406,3 +406,26 @@ The separate 8K fixed-input benchmark remains the prefill/decode measurement: 51
 **Hardware observation:** `system_profiler SPDisplaysDataType` reports 32 GPU cores on this M1 Max. This fact plus the full-kernel arrival/wait pattern is consistent with a 32-group effective residency limit for this fused shader, but does not prove a general hardware maximum.
 
 **Conclusion:** No 36-worker fix was found; no throughput result exists. The current fused decoder uses device-wide spin barriers and the tested 36-worker full kernel does not pass them, even though isolated barrier probes pass. The evidence points to a full-kernel residency/resource constraint; its exact cause is unresolved. Supporting 36 now requires a further resource-footprint change or a synchronization/dispatch redesign, neither validated here. Keep the checked-in M1 profile at 32; 32 remains fastest tested and validated, not a proven hardware-wide ceiling.
+
+### 2026-10-28 — MLP/head worker-width comparison and 32/32/32 validation
+
+**Configuration and source state:** Apple M1 Max (18,2, 64 GB, `applegpu_g13s`), local Flint INT4 checkpoint at `/Users/me/mirror/huggingface.co/RecursiveSI/flint-int4`, MLX 0.32.0. Experiments used Rec branch `experiment/m1-max-port` at commit `7970460`; the worktree was clean at the start. Runtime kernels and the checked-in `32/8/8` default were not changed. Test-only overrides were added to `validate_resident.py` and `benchmark_resident.py` for MLP/head worker counts.
+
+**Correctness procedure/results:** Ran 12-step greedy packet-vs-scalar checks with three repeats for `32/32/8`, `32/8/32`, and `32/32/32`; all passed with packet sizes 1, 3, and 8 and eight native checks. Then ran the full sampled validator at `32/32/32`. It covers the 34-token prompt, 513- and 8,192-token contexts, filtered and unfiltered sampling, penalties, EOS truncation, cancellation, and a 520-token greedy packet case with native checks on its first eight positions.
+
+The first full-matrix attempt reported one token mismatch at context 34, temperature 1, top-p 0.01, top-k 0, decode position 1: packet `[1978, 877, 295]` versus scalar `[877, 295, 3208]`. The original assertion did not record the seed or packet logits/traces. Added a focused `--sampling-case low-top-p` mode and mismatch diagnostics to the existing validator. That focused case passed for seeds 42 and 73 at all three worker profiles. A complete `32/32/32` full-matrix rerun also passed. The initial mismatch is not reproduced; its cause remains unknown and it is not considered fixed.
+
+**8K fixed-token benchmark:** Used the existing benchmark procedure: deterministic varied-ID 8,192-token prompt, four decode warmups, 128 fixed-token resident decode steps, three runs, median. Decode excludes sampling and frontend overhead.
+
+| Profile (`workers/mlp/head`) | Prefill tok/s | Fixed-token decode tok/s |
+| --- | ---: | ---: |
+| 32/8/8 | 506.19 | 32.11 |
+| 32/32/8 | 504.33 | 49.58 |
+| 32/8/32 | 501.61 | 34.20 |
+| 32/32/32 | 510.58 | 56.64 |
+
+Against the same-session `32/8/8` control, decode changed by +54.4% for `32/32/8`, +6.5% for `32/8/32`, and +76.3% for `32/32/32`. Prefill rates remained within about 2% across profiles and use the same native MLX path. The combined 32/32/32 profile is the fastest of these tested fixed-token configurations; this benchmark alone does not establish GPU saturation.
+
+**Separate sampled-decode timing:** The successful full-validator run also timed 256 output tokens after its 34-token prompt, four runs per mode with the first discarded; reported medians (scalar / packet tok/s) were: greedy 79.05 / 87.94; temperature 0.6 unfiltered 76.81 / 84.96; temperature 1 unfiltered 79.73 / 87.60; temperature 0.6, top-p 0.95, top-k 20: 73.72 / 80.91; temperature 1 with the same filters: 73.27 / 81.79; and that filtered mode with presence penalty 1.5: 78.00 / 81.88. These short-prompt sampled rates are a separate workload and are not directly comparable with the 8K fixed-token figures.
+
+**Verification:** Full M1 `unittest` suite passed: 55 tests, 1 skipped. Python compilation, both validation/benchmark CLI help checks, `git diff --check`, and Ruff 0.17.1 lint and format checks passed. Applied the pinned formatter to these two modified test scripts only; no runtime files changed. No full-context, peak-memory, or GPU saturation measurement was performed. Keep `32/8/8` as the checked-in profile unless separately approved; use `32/32/32` only as an experimental override pending more repeatable coverage, especially beyond 8K contexts.

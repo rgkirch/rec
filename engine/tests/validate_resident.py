@@ -154,9 +154,7 @@ def validate_sustained_native(engine, model, steps, repeats, prompt_tokens=1):
                     rec_trace_shape=list(trace.shape),
                 )
                 if native_trace.shape == trace.shape and native_trace.ndim == 2:
-                    difference = mx.abs(
-                        native_trace.astype(mx.float32) - trace.astype(mx.float32)
-                    )
+                    difference = mx.abs(native_trace.astype(mx.float32) - trace.astype(mx.float32))
                     unequal = mx.sum(native_trace != trace, axis=1).tolist()
                     maximum = mx.max(difference, axis=1).tolist()
                     first = next((index for index, count in enumerate(unequal) if count), None)
@@ -253,9 +251,7 @@ def validate_greedy_packet_once(engine, model, resident, prompt, steps, repeat):
 
         reference_snapshot = copy_array(reference_logits)
         candidate_logits = candidate.prefill(prompt)
-        reference_output_unchanged = mx.array_equal(
-            reference_logits, reference_snapshot
-        ).item()
+        reference_output_unchanged = mx.array_equal(reference_logits, reference_snapshot).item()
         if not mx.array_equal(reference_snapshot, candidate_logits).item():
             difference = mx.abs(
                 reference_snapshot.astype(mx.float32) - candidate_logits.astype(mx.float32)
@@ -266,9 +262,7 @@ def validate_greedy_packet_once(engine, model, resident, prompt, steps, repeat):
                 "reference_argmax": int(mx.argmax(reference_snapshot).item()),
                 "candidate_argmax": int(mx.argmax(candidate_logits).item()),
                 "reference_output_unchanged": reference_output_unchanged,
-                "logits_unequal": int(
-                    mx.sum(reference_snapshot != candidate_logits).item()
-                ),
+                "logits_unequal": int(mx.sum(reference_snapshot != candidate_logits).item()),
                 "logits_max_abs": float(mx.max(difference).item()),
                 "reference_kv_capacity": reference._state["kv"].capacity,
                 "candidate_kv_capacity": candidate._state["kv"].capacity,
@@ -278,7 +272,9 @@ def validate_greedy_packet_once(engine, model, resident, prompt, steps, repeat):
         assert same_kv(reference._state["kv"], candidate._state["kv"]), "Prefill KV differs"
         native_session = engine.make_session(max_new_tokens=steps + 1)
         native_logits = native_session.prefill(prompt)
-        assert mx.array_equal(reference_snapshot, native_logits).item(), "Native prefill logits differ"
+        assert mx.array_equal(reference_snapshot, native_logits).item(), (
+            "Native prefill logits differ"
+        )
         native_session._state["kv"].grow(len(prompt) + steps + 1)
         native_cache = native_session.prompt_cache.layers
         for row, cache in zip(engine.metadata[:49], native_cache, strict=True):
@@ -365,9 +361,7 @@ def validate_greedy_packet_once(engine, model, resident, prompt, steps, repeat):
                     "logits_equal_at_mismatch": mx.array_equal(
                         packet_logits, expected_logits
                     ).item(),
-                    "logits_unequal_values": int(
-                        mx.sum(packet_logits != expected_logits).item()
-                    ),
+                    "logits_unequal_values": int(mx.sum(packet_logits != expected_logits).item()),
                     "logits_max_abs": float(mx.max(difference).item()),
                     "trace_unequal_per_row": trace_unequal,
                     "first_divergent_layer": next(
@@ -561,7 +555,9 @@ def instrument_stage_kernel(
     )
     rms_anchor = "        {rms_256_w4(h,(const device bfloat16_t*)(bank+d[3]),n,"
     if source.count(rms_anchor) != 1:
-        raise ValueError(f"Expected one layer input-normalization anchor, found {source.count(rms_anchor)}")
+        raise ValueError(
+            f"Expected one layer input-normalization anchor, found {source.count(rms_anchor)}"
+        )
     source = source.replace(rms_anchor, worker_input_capture + rms_anchor, 1)
 
     if two_phase_qkv or round_qkv:
@@ -736,14 +732,18 @@ def validate_layer0_stages(
     new_keys = attention_module.k_norm(raw_keys).transpose(0, 2, 1, 3)
     new_values = raw_values.transpose(0, 2, 1, 3)
     keys, values = native_cache[0].update_and_fetch(new_keys, new_values)
-    attention_core = mx.fast.scaled_dot_product_attention(
-        query,
-        keys,
-        values,
-        scale=attention_module.scale,
-        mask=None,
-        sinks=attention_module.softmax_offset.astype(query.dtype),
-    ).transpose(0, 2, 1, 3).reshape(batch, length, -1)
+    attention_core = (
+        mx.fast.scaled_dot_product_attention(
+            query,
+            keys,
+            values,
+            scale=attention_module.scale,
+            mask=None,
+            sinks=attention_module.softmax_offset.astype(query.dtype),
+        )
+        .transpose(0, 2, 1, 3)
+        .reshape(batch, length, -1)
+    )
     attention = attention_module.o_proj(attention_core)
     attention_residual = hidden + attention
     mlp_input = layer.post_attention_layernorm(attention_residual)
@@ -789,7 +789,9 @@ def validate_layer0_stages(
     )
     independent_raw_unequal = mx.sum(independent_raw != native_raw_qkv, axis=1).tolist()
     independent_raw_max_abs = float(
-        mx.max(mx.abs(independent_raw.astype(mx.float32) - native_raw_qkv.astype(mx.float32))).item()
+        mx.max(
+            mx.abs(independent_raw.astype(mx.float32) - native_raw_qkv.astype(mx.float32))
+        ).item()
     )
     print(
         json.dumps(
@@ -814,10 +816,7 @@ def validate_layer0_stages(
         captured_raw_unequal = mx.sum(captured_raw_qkv != independent_raw, axis=1).tolist()
         captured_raw_max_abs = float(
             mx.max(
-                mx.abs(
-                    captured_raw_qkv.astype(mx.float32)
-                    - independent_raw.astype(mx.float32)
-                )
+                mx.abs(captured_raw_qkv.astype(mx.float32) - independent_raw.astype(mx.float32))
             ).item()
         )
         print(
@@ -899,7 +898,23 @@ def main():
     parser.add_argument(
         "--workers",
         type=int,
-        help="Experimental resident-worker override; leaves MLP/head workers unchanged",
+        help="Experimental resident-worker override",
+    )
+    parser.add_argument(
+        "--mlp-workers",
+        type=int,
+        choices=(8, 32, 64),
+        help="Experimental MLP/expert worker width (M1 Max only)",
+    )
+    parser.add_argument(
+        "--head-workers",
+        type=int,
+        help="Experimental final-vocabulary-head worker width (M1 Max only)",
+    )
+    parser.add_argument(
+        "--sampling-case",
+        choices=("low-top-p",),
+        help="Run only the natural-prompt low-top-p filtered-sampling case",
     )
     parser.add_argument(
         "--sustained-steps",
@@ -967,6 +982,13 @@ def main():
         help="In stage diagnostics, assign one Q/K/V head per group per globally synchronized round",
     )
     args = parser.parse_args()
+    if args.sampling_case and (
+        args.sustained_steps
+        or args.greedy_packet_steps
+        or args.repeat_prefill
+        or args.stage_diagnostics
+    ):
+        parser.error("--sampling-case cannot be combined with other validation modes")
     if (
         args.sustained_steps < 0
         or args.repeats < 1
@@ -995,7 +1017,9 @@ def main():
         or args.greedy_packet_steps
         or args.repeat_prefill
     ):
-        parser.error("--stage-diagnostics requires --workers and cannot be combined with step-validation modes")
+        parser.error(
+            "--stage-diagnostics requires --workers and cannot be combined with step-validation modes"
+        )
     qkv_modes = (
         args.qkv_single_owner,
         args.qkv_single_owner_block,
@@ -1006,15 +1030,29 @@ def main():
         parser.error("diagnostic QKV modes require --stage-diagnostics")
     if sum(qkv_modes) > 1:
         parser.error("choose only one diagnostic QKV mode")
-    if args.workers is not None:
+    if any(value is not None for value in (args.workers, args.mlp_workers, args.head_workers)):
         from dataclasses import replace
 
         from rec_mlx.kernels import device
 
         base_profile = device.profile_for_device(mx.device_info())
         if base_profile.chip != "M1 Max":
-            parser.error("--workers override is reserved for the M1 Max experiment")
-        experimental_profile = replace(base_profile, workers=args.workers)
+            parser.error("worker overrides are reserved for the M1 Max experiment")
+        workers = base_profile.workers if args.workers is None else args.workers
+        mlp_workers = base_profile.mlp_workers if args.mlp_workers is None else args.mlp_workers
+        head_workers = base_profile.head_workers if args.head_workers is None else args.head_workers
+        if workers < 1:
+            parser.error("--workers must be positive")
+        if not 1 <= mlp_workers <= workers:
+            parser.error("--mlp-workers must fit the resident worker pool")
+        if not 1 <= head_workers <= workers:
+            parser.error("--head-workers must fit the resident worker pool")
+        experimental_profile = replace(
+            base_profile,
+            workers=workers,
+            mlp_workers=mlp_workers,
+            head_workers=head_workers,
+        )
         device.profile_for_device = lambda _info: experimental_profile
     mx.set_cache_limit(256 * 1024**2)
     model = QATModel(args.model)
@@ -1047,16 +1085,13 @@ def main():
         def capture_stages(*call_args, **call_kwargs):
             call_kwargs = dict(call_kwargs)
             call_kwargs["output_shapes"] = [
-                *call_kwargs["output_shapes"], (16 * 6144 + args.workers * 4096,)
+                *call_kwargs["output_shapes"],
+                (16 * 6144 + args.workers * 4096,),
             ]
-            call_kwargs["output_dtypes"] = [
-                *call_kwargs["output_dtypes"], mx.bfloat16
-            ]
+            call_kwargs["output_dtypes"] = [*call_kwargs["output_dtypes"], mx.bfloat16]
             outputs = stage_kernel(*call_args, **call_kwargs)
             captured_stages["values"] = outputs[-1][: 16 * 6144].reshape(16, 6144)
-            captured_stages["workers"] = outputs[-1][
-                16 * 6144 :
-            ].reshape(args.workers, 4096)
+            captured_stages["workers"] = outputs[-1][16 * 6144 :].reshape(args.workers, 4096)
             return outputs[:-1]
 
         engine.kernel = capture_stages
@@ -1103,9 +1138,7 @@ def main():
         if args.capture_group_tokens:
             from rec_mlx.kernels.sampling import ResidentSampler
 
-            resident = ResidentSampler(
-                megakernel, engine, specification, capture_group_tokens=True
-            )
+            resident = ResidentSampler(megakernel, engine, specification, capture_group_tokens=True)
         validate_greedy_packets(
             engine, model, resident, prompt, args.greedy_packet_steps, args.repeats
         )
@@ -1150,8 +1183,12 @@ def main():
         (1, 0.95, 20, 1.5),
         (1, 0.95, 20, -1.5),
     ]
+    contexts = (len(prompt), 513, 8192)
+    if args.sampling_case == "low-top-p":
+        contexts = (len(prompt),)
+        settings = [(1, 0.01, 0, 0)]
     results = []
-    for context in (len(prompt), 513, 8192):
+    for context in contexts:
         ids = (prompt * ((context + len(prompt) - 1) // len(prompt)))[:context]
         for temperature, top_p, top_k, penalty in settings if context != 8192 else settings[:1]:
             for seed in (42, 73) if context != 8192 else (42,):
@@ -1223,6 +1260,7 @@ def main():
                             break
                     scalar_key = mx.random.state[0]
                     mx.random.state[0] = packet_key
+                    candidate_position = candidate._state["position"]
                     actual = resident.block(
                         candidate._state,
                         packet_input,
@@ -1234,15 +1272,40 @@ def main():
                         presence_penalty=penalty,
                     )
                     packet_key = mx.random.state[0]
-                    assert actual == expected, (
-                        context,
-                        temperature,
-                        top_p,
-                        top_k,
-                        position,
-                        actual,
-                        expected,
-                    )
+                    if actual != expected:
+                        print(
+                            json.dumps(
+                                dict(
+                                    sampling_mismatch=True,
+                                    context=context,
+                                    temperature=temperature,
+                                    top_p=top_p,
+                                    top_k=top_k,
+                                    presence_penalty=penalty,
+                                    seed=seed,
+                                    position=position,
+                                    packet_input=packet_input,
+                                    packet_count=count,
+                                    reference_position=reference._state["position"],
+                                    candidate_position_before=candidate_position,
+                                    candidate_position_after=candidate._state["position"],
+                                    actual=actual,
+                                    expected=expected,
+                                    packet_logits_equal=[
+                                        bool(
+                                            mx.array_equal(captured["logits"][i], logits[i]).item()
+                                        )
+                                        for i in range(len(actual))
+                                    ],
+                                    packet_traces_equal=[
+                                        bool(mx.array_equal(captured["trace"][i], traces[i]).item())
+                                        for i in range(len(actual))
+                                    ],
+                                )
+                            ),
+                            flush=True,
+                        )
+                        raise AssertionError("Filtered packet tokens differ from scalar sampling")
                     assert mx.array_equal(packet_key, scalar_key).item(), "Sampler key mismatch"
                     for offset in range(len(actual)):
                         assert mx.array_equal(captured["logits"][offset], logits[offset]).item(), (
@@ -1275,6 +1338,19 @@ def main():
                 del reference, candidate, native_session, native_cache, a, b
                 mx.clear_cache()
 
+    if args.sampling_case:
+        result = dict(
+            device=mx.device_info(),
+            profile=vars(engine.device_profile),
+            config_sha256=hashlib.sha256((args.model / "config.json").read_bytes()).hexdigest(),
+            sampling_case=args.sampling_case,
+            cases=results,
+        )
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(result, indent=2) + "\n")
+        print(json.dumps(result), flush=True)
+        return
     stopping = validate_stopping(engine, resident, specification, tokenizer, prompt)
     print(json.dumps(dict(stopping=stopping)), flush=True)
     performance = []
