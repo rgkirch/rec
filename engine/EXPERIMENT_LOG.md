@@ -437,3 +437,11 @@ Against the same-session `32/8/8` control, decode changed by +54.4% for `32/32/8
 **Verification:** The full M1 `unittest` suite passed again: 55 tests, 1 skipped. Ran `validate_resident.py --sampling-case low-top-p` with no worker overrides; it selected `32/32/32` and passed both seeds (42, 73), 16 positions each. The full sampled validator and 3-repeat greedy packet check had already passed at the identical `32/32/32` settings using explicit overrides. The focused greedy-packet CLI mode itself requires an explicit `--workers` value; this guard was left unchanged.
 
 **Remaining limits:** The first full-matrix mismatch described above remains unexplained and unreproduced. The promotion is based on the faster measured decode and passing tested sampled-generation cases; it does not validate contexts beyond 8K, measured peak memory, or GPU saturation. The 32-worker count remains the fastest tested M1 profile, not a proven hardware-wide limit.
+
+### 2026-10-29 — Enable the rec launcher on M1 Max
+
+**Change:** Added `Apple M1 Max` to the launcher hardware allowlist. The existing RAM preflight still enforces the bundle's 48 GiB minimum. The local M1 Max reports 64 GiB and `machdep.cpu.brand_string` returns `Apple M1 Max`. The manifest's release-defined context default and explicit `rec serve --context TOKENS` behavior are unchanged.
+
+**Documentation/tests:** Updated the README hardware requirements and the chip allowlist test.
+
+**Verification:** `go test -race ./...` and `go vet ./...` passed using Go 1.26.8 from an isolated Nix shell. `gofmt` and `git diff --check` passed. The local source now supports `rec launch pi` on M1 Max; the packaged/released launcher was not built or installed in this experiment.
