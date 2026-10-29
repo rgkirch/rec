@@ -378,3 +378,13 @@ The separate 8K fixed-input benchmark remains the prefill/decode measurement: 51
 **Related long-context results:** One sampled-packet run at 229,376 tokens completed 12 positions in three packets and matched scalar decode; the first eight positions also matched native MLX layer traces and logits. This was a single synthetic prompt check, not general 229K parity. The 245,760- and 262,131-token runs were terminated without results. A separate three-repeat sampled-packet attempt at 196,608 tokens completed one passing repeat and timed out before the remaining repeats. No 261,120-token prompt was run.
 
 **Conclusion:** The initial 196,608-token mismatch remains unexplained and must not be described as fixed or as a confirmed inference bug. The repeat-prefill diagnostic did not reproduce it, so there is no minimized failure yet. No full-context sampled-generation or peak-memory result was obtained. At these runs, Rec was at `49ebf77` with uncommitted validation-harness edits.
+
+### 2026-10-28 — 36-worker M1 smoke test fails synchronization
+
+**Procedure:** At Rec commit `acf7272`, ran the existing greedy packet validator with `--workers 36 --greedy-packet-steps 12` on its 34-token natural prompt. The profile was `workers=36`, `mlp_workers=8`, `head_workers=8`; the coherent-scratch transform accepted the configuration and the kernel compiled/launched.
+
+**Result:** The first scalar `engine.forward` decode failed before native or packet comparisons with `GPU synchronization failed` and diagnostic value `1` for all 36 groups. No throughput measurement was taken.
+
+**Focused controls:** Ran the existing barrier payload probe at 36 workers for 16 iterations with coherent writer and reader pointers. Both the global barrier and the KV-team barrier with team size 9 completed with zero diagnostics. These small probes do not reproduce the full megakernel's scratch/register/resource conditions, so they do not explain the decode failure.
+
+**Conclusion:** The 36-worker M1 schedule is not validated and must not be used or benchmarked as a candidate yet. The coherent transform's supported range through 36 is not evidence of runtime correctness. The failure is consistent with a synchronization/resource issue in the full schedule, but its cause is unknown; it does not establish a hardware worker ceiling. Keep the default at the measured-and-validated 32 workers.
